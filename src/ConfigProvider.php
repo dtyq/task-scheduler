@@ -10,14 +10,16 @@ namespace Dtyq\TaskScheduler;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerClearCrontab;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerCreateCrontab;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerExecuteCrontab;
-use Dtyq\TaskScheduler\Util\Functions;
 use Hyperf\Crontab\Crontab;
 
 class ConfigProvider
 {
     public function __invoke(): array
     {
-        $appEnv = Functions::getEnv();
+        $appEnv = '';
+        if (function_exists('env')) {
+            $appEnv = env('APP_ENV', '');
+        }
 
         return [
             'dependencies' => [
