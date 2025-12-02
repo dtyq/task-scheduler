@@ -11,14 +11,12 @@ use DateTime;
 use Dtyq\TaskScheduler\Entity\Query\Page;
 use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerCrontabQuery;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
-use Hyperf\Crontab\Annotation\Crontab;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 use Throwable;
 
 use function Hyperf\Config\config;
 
-#[Crontab(rule: '* * * * *', name: 'TaskSchedulerCreateCrontab', singleton: true, mutexExpires: 90, onOneServer: true, callback: 'execute', memo: '创建未来 n 天的调度数据')]
 class TaskSchedulerCreateCrontab
 {
     private LoggerInterface $logger;

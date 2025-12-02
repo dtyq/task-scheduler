@@ -15,14 +15,12 @@ use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
 use Dtyq\TaskScheduler\Util\Locker;
 use Hyperf\Coroutine\Concurrent;
-use Hyperf\Crontab\Annotation\Crontab;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 use Throwable;
 
 use function Hyperf\Config\config;
 
-#[Crontab(rule: '* * * * *', name: 'TaskSchedulerExecuteCrontab', singleton: true, mutexExpires: 90, onOneServer: true, callback: 'execute', memo: '执行调度')]
 class TaskSchedulerExecuteCrontab
 {
     protected Concurrent $concurrent;

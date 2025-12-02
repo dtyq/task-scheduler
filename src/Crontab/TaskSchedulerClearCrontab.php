@@ -13,13 +13,11 @@ use Dtyq\TaskScheduler\Entity\Query\Page;
 use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerQuery;
 use Dtyq\TaskScheduler\Entity\TaskScheduler;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
-use Hyperf\Crontab\Annotation\Crontab;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
 
 use function Hyperf\Config\config;
 
-#[Crontab(rule: '0 2 * * *', name: 'TaskSchedulerClearCrontab', singleton: true, mutexExpires: 600, onOneServer: true, callback: 'execute', memo: '清理超过 n 天的调度数据')]
 class TaskSchedulerClearCrontab
 {
     private LoggerInterface $logger;
