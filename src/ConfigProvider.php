@@ -34,30 +34,32 @@ class ConfigProvider
                 ],
             ],
             'crontab' => [
-                (new Crontab())
-                    ->setName($appEnv . '.TaskSchedulerClearCrontab')
-                    ->setRule('0 2 * * *')
-                    ->setCallback([TaskSchedulerClearCrontab::class, 'execute'])
-                    ->setSingleton(true)
-                    ->setMutexExpires(600)
-                    ->setOnOneServer(true)
-                    ->setMemo('清理超过 n 天的调度数据'),
-                (new Crontab())
-                    ->setName($appEnv . '.TaskSchedulerCreateCrontab')
-                    ->setRule('* * * * *')
-                    ->setCallback([TaskSchedulerCreateCrontab::class, 'execute'])
-                    ->setSingleton(true)
-                    ->setMutexExpires(90)
-                    ->setOnOneServer(true)
-                    ->setMemo('创建未来 n 天的调度数据'),
-                (new Crontab())
-                    ->setName($appEnv . '.TaskSchedulerExecuteCrontab')
-                    ->setRule('* * * * *')
-                    ->setCallback([TaskSchedulerExecuteCrontab::class, 'execute'])
-                    ->setSingleton(true)
-                    ->setMutexExpires(90)
-                    ->setOnOneServer(true)
-                    ->setMemo('执行调度'),
+                'crontab' => [
+                    (new Crontab())
+                        ->setName($appEnv . '.TaskSchedulerClearCrontab')
+                        ->setRule('0 2 * * *')
+                        ->setCallback([TaskSchedulerClearCrontab::class, 'execute'])
+                        ->setSingleton(true)
+                        ->setMutexExpires(600)
+                        ->setOnOneServer(true)
+                        ->setMemo('清理超过 n 天的调度数据'),
+                    (new Crontab())
+                        ->setName($appEnv . '.TaskSchedulerCreateCrontab')
+                        ->setRule('* * * * *')
+                        ->setCallback([TaskSchedulerCreateCrontab::class, 'execute'])
+                        ->setSingleton(true)
+                        ->setMutexExpires(90)
+                        ->setOnOneServer(true)
+                        ->setMemo('创建未来 n 天的调度数据'),
+                    (new Crontab())
+                        ->setName($appEnv . '.TaskSchedulerExecuteCrontab')
+                        ->setRule('* * * * *')
+                        ->setCallback([TaskSchedulerExecuteCrontab::class, 'execute'])
+                        ->setSingleton(true)
+                        ->setMutexExpires(90)
+                        ->setOnOneServer(true)
+                        ->setMemo('执行调度'),
+                ],
             ],
             'publish' => [
                 [
