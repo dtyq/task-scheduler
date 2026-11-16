@@ -29,7 +29,7 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use ReflectionMethod;
 
 /**
- * 使用真实查询构造器和 Mock 连接验证 SQL 分组，不连接数据库。
+ * 使用真实查询构造器和 Mock 连接验证环境集合条件，不连接数据库。
  * @internal
  * @coversNothing
  */
@@ -108,7 +108,7 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
                 [
                     true,
                     true,
-                    ' and (`environment` = ? or `environment` = ?)',
+                    ' and `environment` in (?, ?)',
                     [
                         'test-current',
                         '',
@@ -165,7 +165,7 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
             ->method($method)
             ->willReturnCallback(static function (string $sql, array $bindings) use ($includeEmpty): int {
                 self::assertStringContainsString(
-                    $includeEmpty ? '(`environment` = ? or `environment` = ?)' : '`environment` = ?',
+                    $includeEmpty ? '`environment` in (?, ?)' : '`environment` = ?',
                     $sql
                 );
                 self::assertContains('test-current', $bindings);
@@ -224,7 +224,7 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
         $connection->expects(self::once())
             ->method('select')
             ->willReturnCallback(static function (string $sql, array $bindings): array {
-                self::assertStringContainsString('(`environment` = ? or `environment` = ?)', $sql);
+                self::assertStringContainsString('`environment` in (?, ?)', $sql);
                 self::assertSame([
                     'test-current',
                     '',

@@ -18,7 +18,7 @@ use function Hyperf\Config\config;
 abstract class AbstractRepository
 {
     /**
-     * 可选包含空环境历史数据，环境条件分组后再与其他业务条件组合。
+     * 可选将空环境加入允许集合，再与其他业务条件组合。
      */
     protected function createBuilder(Builder $builder): Builder
     {
@@ -28,10 +28,10 @@ abstract class AbstractRepository
         }
 
         if (config('task_scheduler.include_empty_environment', false)) {
-            $builder->where(static function (Builder $query) use ($appEnv): void {
-                $query->where('environment', $appEnv)
-                    ->orWhere('environment', '');
-            });
+            $builder->whereIn('environment', [
+                $appEnv,
+                '',
+            ]);
         } else {
             $builder->where('environment', $appEnv);
         }
