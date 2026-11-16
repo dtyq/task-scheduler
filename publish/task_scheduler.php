@@ -11,7 +11,11 @@ return [
     'clear_days' => 10,
 
     // 开启环境隔离
-    'environment_enabled' => false,
+    'environment_enabled' => true,
+
+    // 环境隔离开启时，是否同时处理 environment 为空字符串的历史任务和周期规则
+    // 共享数据库只能由一个环境开启，避免多个环境共同承接历史任务
+    'include_empty_environment' => false,
 
     // 同时执行的定时任务数量，协程数量控制
     'concurrency' => 500,
