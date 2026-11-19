@@ -22,10 +22,8 @@ class ConfigProvider
         }
 
         return [
-            'dependencies' => [
-            ],
-            'commands' => [
-            ],
+            'dependencies' => [],
+            'commands' => [],
             'annotations' => [
                 'scan' => [
                     'paths' => [
