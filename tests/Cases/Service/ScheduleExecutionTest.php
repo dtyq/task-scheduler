@@ -34,8 +34,8 @@ class ScheduleExecutionTest extends SchedulerServiceTestCase
         MockScheduledCallback::$calls = 0;
         $task = $this->task();
         $stale = clone $task;
-        $this->tasks->expects(self::exactly(2))->method('claimForExecution')->with(321)->willReturnOnConsecutiveCalls(true, false);
-        $this->tasks->expects(self::once())->method('save')->with(self::callback(static fn (TaskScheduler $saved): bool => $saved->getStatus() === TaskSchedulerStatus::Success))->willReturnArgument(0);
+        $this->tasks->expects(self::exactly(2))->method('claimForExecution')->with(321, self::isInstanceOf(DateTime::class))->willReturnOnConsecutiveCalls(true, false);
+        $this->tasks->expects(self::once())->method('finishExecution')->with(self::callback(static fn (TaskScheduler $saved): bool => $saved->getStatus() === TaskSchedulerStatus::Success), self::isInstanceOf(DateTime::class))->willReturn(true);
         $this->logs->expects(self::once())->method('create')->willReturnArgument(0);
         self::assertTrue($this->service->execute($task)->isSuccess());
         $skipped = $this->service->execute($stale);
@@ -52,6 +52,7 @@ class ScheduleExecutionTest extends SchedulerServiceTestCase
     {
         $this->tasks->method('claimForExecution')->willReturn(false);
         $this->tasks->expects(self::never())->method('save');
+        $this->tasks->expects(self::never())->method('finishExecution');
         $this->tasks->expects(self::never())->method('markRunningFailed');
         $this->logs->expects(self::never())->method('create');
         self::assertFalse($this->service->execute($this->task())->isSuccess());
@@ -67,7 +68,7 @@ class ScheduleExecutionTest extends SchedulerServiceTestCase
         $task->setRetryTimes($retries);
         $task->setCallbackMethod([MockScheduledCallback::class, 'fail']);
         $this->tasks->method('claimForExecution')->willReturn(true);
-        $this->tasks->expects(self::once())->method('save')->willReturnArgument(0);
+        $this->tasks->expects(self::once())->method('finishExecution')->willReturn(true);
         $this->logs->expects(self::once())->method('create')->willReturnArgument(0);
         self::assertFalse($this->service->execute($task)->isSuccess());
         self::assertSame($expected, $task->getStatus());
@@ -89,9 +90,9 @@ class ScheduleExecutionTest extends SchedulerServiceTestCase
     {
         $task = $this->task();
         $this->tasks->method('claimForExecution')->willReturn(true);
-        $this->tasks->method('save')->willReturnArgument(0);
+        $this->tasks->method('finishExecution')->willReturn(true);
         $this->logs->method('create')->willThrowException(new RuntimeException('mock log failure'));
-        $this->tasks->expects(self::once())->method('markRunningFailed')->with(321);
+        $this->tasks->expects(self::once())->method('markRunningFailed')->with(321, self::isInstanceOf(DateTime::class));
         $this->tasks->expects(self::never())->method('changeStatus');
         $this->expectException(RuntimeException::class);
         $this->service->execute($task);
@@ -129,6 +130,7 @@ class ScheduleExecutionTest extends SchedulerServiceTestCase
         $worker = (new ReflectionClass(TaskSchedulerExecuteCrontab::class))->newInstanceWithoutConstructor();
         (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'scheduleTaskDomainService'))->setValue($worker, $service);
         (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'concurrent'))->setValue($worker, $concurrent);
+        (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'config'))->setValue($worker, ['running_timeout_seconds' => 0]);
         $worker->execute();
         self::assertSame([0, 10, 20], $seen);
     }

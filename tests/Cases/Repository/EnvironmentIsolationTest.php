@@ -8,9 +8,11 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Test\Cases\Repository;
 
 use DateTime;
+use Dtyq\TaskScheduler\Entity\TaskScheduler;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Repository\Persistence\AbstractRepository;
 use Dtyq\TaskScheduler\Repository\Persistence\TaskSchedulerCrontabRepository;
+use Dtyq\TaskScheduler\Repository\Persistence\TaskSchedulerLogRepository;
 use Dtyq\TaskScheduler\Repository\Persistence\TaskSchedulerRepository;
 use Dtyq\TaskScheduler\Test\Cases\EnvironmentTestCase;
 use Hyperf\Context\ApplicationContext;
@@ -274,9 +276,11 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
             self::assertStringContainsString($includeEmpty ? '`environment` in (?, ?)' : '`environment` = ?', $sql);
             self::assertSame([TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value], array_slice($bindings, -2));
             self::assertSame(TaskSchedulerStatus::Running->value, $bindings[0]);
+            self::assertSame('2030-01-01 11:00:00', $bindings[1]);
+            self::assertStringContainsString('`actual_time` = ?', $sql);
             return $affected;
         });
-        self::assertSame($affected === 1, (new TaskSchedulerRepository())->claimForExecution(123));
+        self::assertSame($affected === 1, (new TaskSchedulerRepository())->claimForExecution(123, new DateTime('2030-01-01 11:00:00')));
     }
 
     /**
@@ -311,11 +315,112 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
         $this->setEnvironment();
         $connection = $this->connection();
         $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings): int {
-            self::assertSame([TaskSchedulerStatus::Failed->value, 'test-current', 123, TaskSchedulerStatus::Running->value], $bindings);
-            self::assertStringContainsString('`id` = ? and `status` = ?', $sql);
+            self::assertSame([TaskSchedulerStatus::Failed->value, 'test-current', 123, TaskSchedulerStatus::Running->value, '2030-01-01 11:00:00'], $bindings);
+            self::assertStringContainsString('`id` = ? and `status` = ? and `actual_time` = ?', $sql);
             return 0;
         });
-        (new TaskSchedulerRepository())->markRunningFailed(123);
+        (new TaskSchedulerRepository())->markRunningFailed(123, new DateTime('2030-01-01 11:00:00'));
+    }
+
+    /**
+     * 近期Running查询同时限制计划窗口和运行时长，NULL旧数据回退分支必须括号分组。
+     */
+    public function testRunningRecoverySelectKeepsWindowAndLegacyFallback(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertSame([
+                'test-current',
+                TaskSchedulerStatus::Running->value,
+                '2030-01-01 10:00:00',
+                '2030-01-01 12:00:00',
+                123,
+                '2030-01-01 11:00:00',
+                '2030-01-01 11:00:00',
+            ], $bindings);
+            self::assertStringContainsString('`expect_time` >= ? and `expect_time` <= ?', $sql);
+            self::assertStringContainsString('(`actual_time` <= ? or (`actual_time` is null and `expect_time` <= ?))', $sql);
+            self::assertStringContainsString('order by `id` asc limit 200 for update', $sql);
+            return [];
+        });
+        self::assertSame([], (new TaskSchedulerRepository())->lockStaleRunning(
+            new DateTime('2030-01-01 12:00:00'),
+            new DateTime('2030-01-01 10:00:00'),
+            new DateTime('2030-01-01 11:00:00'),
+            123,
+            200
+        ));
+    }
+
+    /**
+     * 历史Running严格早于两小时边界选择，直接批量Timeout不走回调。
+     */
+    public function testHistoricalRunningUsesIndexedRangeAndConditionalClose(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertSame(['test-current', TaskSchedulerStatus::Running->value, '2030-01-01 10:00:00'], $bindings);
+            self::assertStringContainsString('`expect_time` < ?', $sql);
+            self::assertStringContainsString('order by `expect_time` asc, `id` asc limit 200 for update', $sql);
+            return [['id' => 123]];
+        });
+        $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings): int {
+            self::assertSame([TaskSchedulerStatus::Timeout->value, 'test-current', 123, TaskSchedulerStatus::Running->value], $bindings);
+            return 1;
+        });
+        self::assertSame([123], (new TaskSchedulerRepository())->closeRunningBefore(new DateTime('2030-01-01 10:00:00'), 200));
+    }
+
+    /**
+     * 补偿前必须清空旧批次时间，使旧回调无法覆盖Pending或新Running。
+     */
+    public function testRecoveryResetClearsAttemptTimestamp(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings): int {
+            self::assertSame([TaskSchedulerStatus::Pending->value, null, 0, 'test-current', 123, TaskSchedulerStatus::Running->value], $bindings);
+            self::assertStringContainsString('`actual_time` = ?', $sql);
+            return 1;
+        });
+        (new TaskSchedulerRepository())->transitionRunning([123], TaskSchedulerStatus::Pending);
+    }
+
+    /**
+     * 结果更新必须同时匹配当前Running和本轮已落库开始时间。
+     */
+    public function testResultUpdateUsesAttemptTimestamp(): void
+    {
+        $this->setEnvironment();
+        $task = new TaskScheduler();
+        $task->setId(123);
+        $task->setStatus(TaskSchedulerStatus::Success);
+        $task->setRetryTimes(0);
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings): int {
+            self::assertSame([TaskSchedulerStatus::Success->value, 0, 0, 'test-current', 123, TaskSchedulerStatus::Running->value, '2030-01-01 11:00:00'], $bindings);
+            self::assertStringContainsString('`id` = ? and `status` = ? and `actual_time` = ?', $sql);
+            return 0;
+        });
+        self::assertFalse((new TaskSchedulerRepository())->finishExecution($task, new DateTime('2030-01-01 11:00:00')));
+    }
+
+    /**
+     * 恢复凭据按task_id集合批量当前读，并保持相同环境范围。
+     */
+    public function testTimeoutMarkersAreReadInBatchWithCurrentScope(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertSame(['test-current', 123, 456, TaskSchedulerStatus::Timeout->value], $bindings);
+            self::assertStringContainsString('`task_id` in (?, ?)', $sql);
+            self::assertStringContainsString('for update', $sql);
+            return [['task_id' => 123]];
+        });
+        self::assertSame([123], (new TaskSchedulerLogRepository())->findTimedOutTaskIds([123, 456]));
     }
 
     /**

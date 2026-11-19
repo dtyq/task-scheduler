@@ -188,21 +188,121 @@ class TaskSchedulerRepository extends AbstractRepository
     /**
      * 以单条条件更新认领，Redis租约到期后也只允许一个执行者成功。
      */
-    public function claimForExecution(int $id): bool
+    public function claimForExecution(int $id, ?DateTime $startedAt = null): bool
     {
-        return $this->createBuilder(TaskSchedulerModel::query())->where('id', $id)
-            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
-            ->update(['status' => TaskSchedulerStatus::Running->value]) === 1;
+        $startedAt ??= new DateTime();
+        return $this->createBuilder(TaskSchedulerModel::query())
+            ->where('id', $id)
+            ->whereIn('status', [
+                TaskSchedulerStatus::Pending->value,
+                TaskSchedulerStatus::Retry->value,
+            ])
+            ->update([
+                'status' => TaskSchedulerStatus::Running->value,
+                'actual_time' => $startedAt->format('Y-m-d H:i:s'),
+            ]) === 1;
     }
 
     /**
-     * 只标记本次尚未持久化结果的运行项，不覆盖已提交成功或取消状态。
+     * 只有当前执行批次可提交结果，迟到回调不能覆盖恢复后的状态。
      */
-    public function markRunningFailed(int $id): void
+    public function finishExecution(TaskScheduler $task, DateTime $startedAt): bool
     {
-        $this->createBuilder(TaskSchedulerModel::query())->where('id', $id)
+        return $this->createBuilder(TaskSchedulerModel::query())
+            ->where('id', $task->getId())
             ->where('status', TaskSchedulerStatus::Running->value)
-            ->update(['status' => TaskSchedulerStatus::Failed->value]);
+            ->where('actual_time', $startedAt->format('Y-m-d H:i:s'))
+            ->update([
+                'status' => $task->getStatus()->value,
+                'retry_times' => $task->getRetryTimes(),
+                'cost_time' => $task->getCostTime(),
+            ]) === 1;
+    }
+
+    /**
+     * 只标记同一执行批次的运行项，不覆盖新一轮执行或已提交终态。
+     */
+    public function markRunningFailed(int $id, ?DateTime $startedAt = null): void
+    {
+        $builder = $this->createBuilder(TaskSchedulerModel::query())
+            ->where('id', $id)
+            ->where('status', TaskSchedulerStatus::Running->value);
+        if ($startedAt !== null) {
+            $builder->where('actual_time', $startedAt->format('Y-m-d H:i:s'));
+        }
+        $builder->update([
+            'status' => TaskSchedulerStatus::Failed->value,
+        ]);
+    }
+
+    /**
+     * 旧Running实例按已有状态/计划时间索引有界关闭，不读取回调载荷。
+     * @return int[]
+     */
+    public function closeRunningBefore(DateTime $windowStart, int $limit): array
+    {
+        $ids = $this->createBuilder(TaskSchedulerModel::query())
+            ->where('status', TaskSchedulerStatus::Running->value)
+            ->where('expect_time', '<', $windowStart->format('Y-m-d H:i:s'))
+            ->orderBy('expect_time')
+            ->orderBy('id')
+            ->limit($limit)
+            ->lockForUpdate()
+            ->pluck('id')
+            ->all();
+        $ids = array_map('intval', $ids);
+        $this->transitionRunning($ids, TaskSchedulerStatus::Timeout);
+        return $ids;
+    }
+
+    /**
+     * 只锁定近期已超时的Running，旧数据缺少actual_time时使用计划时间。
+     * @return TaskScheduler[]
+     */
+    public function lockStaleRunning(DateTime $now, DateTime $windowStart, DateTime $timeoutBefore, int $afterId, int $limit): array
+    {
+        $models = $this->createBuilder(TaskSchedulerModel::query())
+            ->where('status', TaskSchedulerStatus::Running->value)
+            ->where('expect_time', '>=', $windowStart->format('Y-m-d H:i:s'))
+            ->where('expect_time', '<=', $now->format('Y-m-d H:i:s'))
+            ->where('id', '>', $afterId)
+            ->where(static function ($query) use ($timeoutBefore): void {
+                $time = $timeoutBefore->format('Y-m-d H:i:s');
+                $query->where('actual_time', '<=', $time)
+                    ->orWhere(static function ($legacy) use ($time): void {
+                        $legacy->whereNull('actual_time')->where('expect_time', '<=', $time);
+                    });
+            })
+            ->orderBy('id')
+            ->limit($limit)
+            ->lockForUpdate()
+            ->get();
+        $tasks = [];
+        foreach ($models as $model) {
+            $tasks[] = TaskSchedulerFactory::modelToEntity($model);
+        }
+        return $tasks;
+    }
+
+    /**
+     * 调用方已锁定执行项，恢复时清空旧批次时间以隔离迟到结果。
+     */
+    public function transitionRunning(array $ids, TaskSchedulerStatus $target): void
+    {
+        if ($ids === []) {
+            return;
+        }
+        $values = [
+            'status' => $target->value,
+        ];
+        if ($target === TaskSchedulerStatus::Pending) {
+            $values['actual_time'] = null;
+            $values['cost_time'] = 0;
+        }
+        $this->createBuilder(TaskSchedulerModel::query())
+            ->whereIn('id', $ids)
+            ->where('status', TaskSchedulerStatus::Running->value)
+            ->update($values);
     }
 
     /**

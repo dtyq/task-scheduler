@@ -178,9 +178,12 @@ class TaskScheduler
         ];
     }
 
-    public function execute(): TaskSchedulerExecuteResult
+    /**
+     * 服务入口沿用已落库的认领时间，直接执行仍以当前时刻开始。
+     */
+    public function execute(?DateTime $startedAt = null): TaskSchedulerExecuteResult
     {
-        $this->actualTime = new DateTime();
+        $this->actualTime = $startedAt === null ? new DateTime() : clone $startedAt;
 
         $startTime = microtime(true);
         $result = new TaskSchedulerExecuteResult();

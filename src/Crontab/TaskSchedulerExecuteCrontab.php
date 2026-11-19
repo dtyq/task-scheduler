@@ -41,6 +41,7 @@ class TaskSchedulerExecuteCrontab
     public function execute(): void
     {
         $cutoff = new DateTime();
+        $this->recoverRunning($cutoff);
         $afterId = 0;
         for ($batch = 0; $batch < 1000; ++$batch) {
             $tasks = $this->scheduleTaskDomainService->listTasksForExecution($cutoff, $afterId, 200);
@@ -56,14 +57,69 @@ class TaskSchedulerExecuteCrontab
         }
     }
 
+    /**
+     * 历史与近期Running分开限量维护，恢复后的Pending沿原执行流程认领。
+     */
+    private function recoverRunning(DateTime $now): void
+    {
+        $timeout = (int) ($this->config['running_timeout_seconds'] ?? 3600);
+        if ($timeout <= 0) {
+            return;
+        }
+        if ($timeout >= 7200) {
+            $this->logger->warning('运行超时阈值必须小于恢复窗口，跳过本轮Running维护');
+            return;
+        }
+        for ($batch = 0; $batch < 100; ++$batch) {
+            try {
+                $ids = $this->scheduleTaskDomainService->closeExpiredRunning($now, 200);
+                if ($ids === []) {
+                    break;
+                }
+                $this->logger->warning('关闭超出两小时恢复窗口的Running实例', [
+                    'task_scheduler_ids' => $ids,
+                    'count' => count($ids),
+                ]);
+            } catch (Throwable $error) {
+                $this->logger->error('历史Running关闭失败', [
+                    'exception_type' => get_class($error),
+                ]);
+                break;
+            }
+        }
+        $afterId = 0;
+        for ($batch = 0; $batch < 100; ++$batch) {
+            try {
+                $result = $this->scheduleTaskDomainService->recoverRunningBatch($now, $timeout, $afterId, 200);
+                $lastId = $result['last_id'] ?? $afterId;
+                if ($lastId <= $afterId) {
+                    break;
+                }
+                $afterId = $lastId;
+                $this->logger->warning('Running超时维护完成', [
+                    'retried_ids' => $result['retried'],
+                    'timed_out_ids' => $result['timed_out'],
+                ]);
+            } catch (Throwable $error) {
+                $this->logger->error('Running超时恢复失败', [
+                    'exception_type' => get_class($error),
+                ]);
+                break;
+            }
+        }
+    }
+
     private function run(TaskScheduler $taskScheduler): void
     {
         $expire = (int) ($this->config['lock_timeout'] ?? 60 * 10);
         $lockKey = "TaskSchedulerExecuteCrontab-{$taskScheduler->getId()}";
-        $lockOwner = 'TaskSchedulerExecuteCrontab';
+        // 恢复后的执行可能与旧回调并存，锁所有者必须逐次唯一。
+        $lockOwner = 'TaskSchedulerExecuteCrontab-' . bin2hex(random_bytes(16));
+        $locked = false;
 
         try {
-            if (! $this->locker->mutexLock($lockKey, $lockOwner, max($expire, 1))) {
+            $locked = $this->locker->mutexLock($lockKey, $lockOwner, max($expire, 1));
+            if (! $locked) {
                 return;
             }
 
@@ -79,7 +135,9 @@ class TaskSchedulerExecuteCrontab
                 'exception' => $throwable->getMessage(),
             ]);
         } finally {
-            $this->locker->release($lockKey, $lockOwner);
+            if ($locked) {
+                $this->locker->release($lockKey, $lockOwner);
+            }
         }
     }
 }

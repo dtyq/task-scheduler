@@ -31,6 +31,9 @@ use Throwable;
 
 class TaskSchedulerDomainService
 {
+    // 恢复窗口按计划执行时间计算，超出两小时不再补偿。
+    private const RUNNING_RETRY_WINDOW_SECONDS = 7200;
+
     private readonly LoggerInterface $logger;
 
     public function __construct(
@@ -271,18 +274,15 @@ class TaskSchedulerDomainService
     public function execute(TaskScheduler $scheduleTask): TaskSchedulerExecuteResult
     {
         $scheduleTask->prepareForExecution();
-        if (! $this->scheduleTaskRepository->claimForExecution($scheduleTask->getId())) {
-            $skipped = new TaskSchedulerExecuteResult();
-            $skipped->setSuccess(false);
-            $skipped->setCosTime(0);
-            $skipped->setErrorMessage('任务已被认领、取消或移除');
-            return $skipped;
+        $startedAt = new DateTime();
+        if (! $this->scheduleTaskRepository->claimForExecution($scheduleTask->getId(), $startedAt)) {
+            return $this->skippedResult('任务已被认领、取消或移除');
         }
         $scheduleTask->setStatus(TaskSchedulerStatus::Running);
         $this->logger->info('execute_task_scheduler_start', ['id' => $scheduleTask->getId()]);
 
         try {
-            $result = $scheduleTask->execute();
+            $result = $scheduleTask->execute($startedAt);
             if ($result->isSuccess()) {
                 $scheduleTask->setStatus(TaskSchedulerStatus::Success);
             } else {
@@ -295,15 +295,88 @@ class TaskSchedulerDomainService
                     $scheduleTask->setStatus(TaskSchedulerStatus::Failed);
                 }
             }
-            $this->scheduleTaskRepository->save($scheduleTask);
+            if (! $this->scheduleTaskRepository->finishExecution($scheduleTask, $startedAt)) {
+                $this->logger->notice('忽略过期执行批次的结果', ['id' => $scheduleTask->getId()]);
+                return $this->skippedResult('当前执行批次已过期，结果未覆盖现有状态');
+            }
             $this->createLog($scheduleTask, $result);
             $this->logger->info('execute_task_scheduler_success', ['id' => $scheduleTask->getId(), 'success' => $result->isSuccess(), 'cost_time' => $result->getCosTime()]);
         } catch (Throwable $throwable) {
-            $this->scheduleTaskRepository->markRunningFailed($scheduleTask->getId());
+            $this->scheduleTaskRepository->markRunningFailed($scheduleTask->getId(), $startedAt);
             $this->logger->error('execute_task_scheduler_fail', ['id' => $scheduleTask->getId(), 'exception_type' => get_class($throwable)]);
             throw $throwable;
         }
         return $result;
+    }
+
+    /**
+     * 有界关闭恢复窗口之外的Running实例，不执行或归档历史回调。
+     * @return int[]
+     */
+    #[Transactional]
+    public function closeExpiredRunning(DateTime $now, int $limit = 200): array
+    {
+        $this->validateRecoveryBatch($limit);
+        $windowStart = (clone $now)->setTimestamp($now->getTimestamp() - self::RUNNING_RETRY_WINDOW_SECONDS);
+        return $this->scheduleTaskRepository->closeRunningBefore($windowStart, $limit);
+    }
+
+    /**
+     * 锁定近期Running，首次超时记录恢复凭据，再次超时仅关闭当前实例。
+     * @return array{last_id: int, retried: int[], timed_out: int[]}
+     */
+    #[Transactional]
+    public function recoverRunningBatch(DateTime $now, int $timeoutSeconds, int $afterId = 0, int $limit = 200): array
+    {
+        $this->validateRecoveryBatch($limit);
+        if ($timeoutSeconds < 1 || $timeoutSeconds >= self::RUNNING_RETRY_WINDOW_SECONDS) {
+            throw new TaskSchedulerParamsSchedulerException('运行超时阈值必须大于0且小于7200秒');
+        }
+        $windowStart = (clone $now)->setTimestamp($now->getTimestamp() - self::RUNNING_RETRY_WINDOW_SECONDS);
+        $timeoutBefore = (clone $now)->setTimestamp($now->getTimestamp() - $timeoutSeconds);
+        $tasks = $this->scheduleTaskRepository->lockStaleRunning($now, $windowStart, $timeoutBefore, $afterId, $limit);
+        $retried = $timedOut = $logs = [];
+        if ($tasks === []) {
+            return [
+                'last_id' => $afterId,
+                'retried' => [],
+                'timed_out' => [],
+            ];
+        }
+        $ids = array_map(static fn (TaskScheduler $task): int => $task->getId(), $tasks);
+        $seen = array_fill_keys($this->scheduleTaskLogRepository->findTimedOutTaskIds($ids), true);
+        foreach ($tasks as $task) {
+            if (isset($seen[$task->getId()])) {
+                $timedOut[] = $task->getId();
+                continue;
+            }
+            $result = new TaskSchedulerExecuteResult();
+            $result->setSuccess(false);
+            $result->setCosTime(0);
+            $result->setErrorMessage('执行超时，安排一次恢复重试');
+            $log = TaskSchedulerLogFactory::createByScheduleTask($task);
+            $log->setStatus(TaskSchedulerStatus::Timeout);
+            $log->setResult($result);
+            $log->setCreatedAt(clone $now);
+            $log->prepareForCreation();
+            $log->setEnvironment($task->getEnvironment());
+            $logs[] = $log;
+            $retried[] = $task->getId();
+        }
+        if ($logs !== []) {
+            $this->scheduleTaskLogRepository->batchCreate($logs);
+        }
+        if ($retried !== []) {
+            $this->scheduleTaskRepository->transitionRunning($retried, TaskSchedulerStatus::Pending);
+        }
+        if ($timedOut !== []) {
+            $this->scheduleTaskRepository->transitionRunning($timedOut, TaskSchedulerStatus::Timeout);
+        }
+        return [
+            'last_id' => $tasks[array_key_last($tasks)]->getId(),
+            'retried' => $retried,
+            'timed_out' => $timedOut,
+        ];
     }
 
     /**
@@ -347,6 +420,28 @@ class TaskSchedulerDomainService
     public function existsByExternalId(string $externalId): bool
     {
         return $this->scheduleTaskCrontabRepository->existsByExternalId($externalId);
+    }
+
+    /**
+     * 恢复操作限制单批规模，不允许一次锁定整个历史集合。
+     */
+    private function validateRecoveryBatch(int $limit): void
+    {
+        if ($limit < 1 || $limit > 500) {
+            throw new TaskSchedulerParamsSchedulerException('恢复批次必须在1至500之间');
+        }
+    }
+
+    /**
+     * 未认领或已过期的批次统一返回无写入的跳过结果。
+     */
+    private function skippedResult(string $reason): TaskSchedulerExecuteResult
+    {
+        $result = new TaskSchedulerExecuteResult();
+        $result->setSuccess(false);
+        $result->setCosTime(0);
+        $result->setErrorMessage($reason);
+        return $result;
     }
 
     /**
