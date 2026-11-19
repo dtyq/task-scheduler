@@ -164,9 +164,8 @@ class TaskSchedulerCrontab
             return [];
         }
         $list = ScheduleRule::parse($this->crontab)->preview($this->lastGenTime, $limit, $endTime);
-        if ($list !== []) {
-            $this->lastGenTime = clone $list[array_key_last($list)];
-        }
+        // 满批只推进到最后触发点；不足一批说明窗口已处理完，包括稀疏空窗口。
+        $this->lastGenTime = count($list) === $limit ? clone $list[array_key_last($list)] : clone $endTime;
         return $list;
     }
 

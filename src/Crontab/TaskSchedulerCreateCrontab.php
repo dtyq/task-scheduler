@@ -8,8 +8,6 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Crontab;
 
 use DateTime;
-use Dtyq\TaskScheduler\Entity\Query\Page;
-use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerCrontabQuery;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
@@ -30,36 +28,26 @@ class TaskSchedulerCreateCrontab
 
     public function execute(): void
     {
-        $days = config('task_scheduler.crontab_days', 3);
-        $lastTime = new DateTime();
-        // 获取 lastTime 超过的数据
-        $query = new TaskSchedulerCrontabQuery();
-        $query->setLastGenTimeGt($lastTime);
-        $query->setEnable(true);
-        $page = new Page(1, 100);
-        $limitPage = 100;
-        while (true) {
-            $data = $this->scheduleTaskDomainService->queriesCrontab($query, $page);
-            $list = $data['list'] ?? [];
-            if (empty($list)) {
+        $days = (int) config('task_scheduler.crontab_days', 3);
+        $lowWaterDays = max(0, min($days, (int) config('task_scheduler.generation_low_water_days', 1)));
+        $lowWater = (new DateTime())->modify('+' . $lowWaterDays . ' days');
+        $afterId = 0;
+        // 单次最多扫描一万条；下一分钟重新扫描低水位，避免无限占用生成进程。
+        for ($batch = 0; $batch < 100; ++$batch) {
+            $rules = $this->scheduleTaskDomainService->listCrontabsForGeneration($lowWater, $afterId, 100);
+            if ($rules === []) {
                 break;
             }
-            foreach ($list as $scheduleTask) {
+            foreach ($rules as $rule) {
+                $afterId = $rule->getId();
                 try {
-                    $this->scheduleTaskDomainService->createByCrontab($scheduleTask, $days);
+                    $this->scheduleTaskDomainService->createByCrontab($rule, $days);
                 } catch (Throwable $throwable) {
                     $this->logger->notice('创建调度失败', [
-                        'task_scheduler_id' => $scheduleTask->getId(),
+                        'task_scheduler_id' => $rule->getId(),
                         'exception' => $throwable->getMessage(),
                     ]);
                 }
-            }
-            if ($data['total'] <= $page->getPageNum() * $page->getPage()) {
-                break;
-            }
-            $page->setNextPage();
-            if ($page->getPage() > $limitPage) {
-                break;
             }
         }
     }

@@ -7,6 +7,8 @@ declare(strict_types=1);
 return [
     // 定时生成未来 n 天的数据
     'crontab_days' => 3,
+    // 覆盖进度低于未来一天时补充，不影响旧配置未声明此项的行为。
+    'generation_low_water_days' => 1,
     // 超过 n 天的数据会被清理
     'clear_days' => 10,
 

@@ -14,6 +14,7 @@ use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerCrontabQuery;
 use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerQuery;
 use Dtyq\TaskScheduler\Entity\TaskScheduler;
 use Dtyq\TaskScheduler\Entity\TaskSchedulerCrontab;
+use Dtyq\TaskScheduler\Entity\ValueObject\ScheduleRule;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerExecuteResult;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Exception\TaskSchedulerParamsSchedulerException;
@@ -123,27 +124,56 @@ class TaskSchedulerDomainService
     #[Transactional]
     public function createByCrontab(TaskSchedulerCrontab $scheduleTaskCrontab, int $days = 3): void
     {
-        // if ($days < 1 || $days > 3) {
-        //     throw new TaskSchedulerParamsSchedulerException('仅支持1-3天的周期提前生成');
-        // }
-        $scheduleTaskCrontab->prepareForCreateScheduleTask();
-
-        // 获取未来几天和截止日期的最小值
-        $endTime = (new DateTime())->add(new DateInterval('P' . $days . 'D'));
-        if ($scheduleTaskCrontab->getDeadline()) {
-            $endTime = min($endTime, $scheduleTaskCrontab->getDeadline());
+        if ($days < 1) {
+            throw new TaskSchedulerParamsSchedulerException('生成窗口天数必须为正整数');
         }
-
-        $dateList = $scheduleTaskCrontab->listCycleDate($endTime, 100);
-        foreach ($dateList as $date) {
-            $task = TaskSchedulerFactory::createByCrontab($scheduleTaskCrontab, $date);
-            $this->create($task);
-            // 如果已经进入截止时间，那么关闭该 crontab
-            if ($scheduleTaskCrontab->getDeadline() && $scheduleTaskCrontab->getDeadline() <= $date) {
-                $scheduleTaskCrontab->setEnabled(false);
+        $rule = $this->scheduleTaskCrontabRepository->lockById($scheduleTaskCrontab->getId());
+        if ($rule === null || ! $rule->isEnabled()) {
+            return;
+        }
+        $rule->prepareForCreateScheduleTask();
+        $now = new DateTime();
+        $endTime = (clone $now)->add(new DateInterval('P' . $days . 'D'));
+        if ($rule->getDeadline() !== null && $rule->getDeadline() < $endTime) {
+            $endTime = clone $rule->getDeadline();
+        }
+        if ($endTime < $rule->getLastGenTime()) {
+            return;
+        }
+        // 新规则跳过未生成的旧周期，保留当前分钟以支持首次执行本次。
+        $floor = intdiv($now->getTimestamp(), 60) * 60 - 1;
+        if (ScheduleRule::parse($rule->getCrontab())->isExtended() && $rule->getLastGenTime()->getTimestamp() < $floor) {
+            $rule->setLastGenTime((new DateTime())->setTimestamp($floor));
+        }
+        if ($endTime < $rule->getLastGenTime()) {
+            return;
+        }
+        $dates = $rule->listCycleDate($endTime, 100);
+        $existing = array_fill_keys($this->scheduleTaskRepository->findExistingTimes($rule->getExternalId(), $dates), true);
+        $tasks = [];
+        foreach ($dates as $date) {
+            if (isset($existing[$date->format('Y-m-d H:i:s')])) {
+                continue;
             }
+            $task = TaskSchedulerFactory::createByCrontab($rule, $date);
+            $task->prepareForCreation();
+            $tasks[] = $task;
         }
-        $this->scheduleTaskCrontabRepository->save($scheduleTaskCrontab);
+        if ($tasks !== []) {
+            $this->scheduleTaskRepository->batchCreate($tasks);
+        }
+        $this->scheduleTaskCrontabRepository->updateGenerationTime($rule->getId(), $rule->getLastGenTime());
+        $scheduleTaskCrontab->setLastGenTime(clone $rule->getLastGenTime());
+        // 已生成到截止不等于执行结束，不能提前关闭尚有未来执行项的规则。
+    }
+
+    /**
+     * 为后台续建提供不受条件变动影响的有界扫描。
+     * @return TaskSchedulerCrontab[]
+     */
+    public function listCrontabsForGeneration(DateTime $lowWater, int $afterId, int $limit = 100): array
+    {
+        return $this->scheduleTaskCrontabRepository->listForGeneration($lowWater, $afterId, $limit);
     }
 
     /**

@@ -35,19 +35,20 @@ class TaskSchedulerEnvironmentCompatibilityTest extends EnvironmentTestCase
         $rule = $this->rule();
         $lastGenTime = clone $rule->getLastGenTime();
         $tasks = $this->createMock(TaskSchedulerRepository::class);
-        $tasks->expects(self::atLeastOnce())
-            ->method('save')
-            ->willReturnCallback(static function (TaskScheduler $task): TaskScheduler {
-                self::assertSame('test-current', $task->getEnvironment());
-                self::assertSame('mock-external', $task->getExternalId());
-                return $task;
+        $tasks->expects(self::once())
+            ->method('batchCreate')
+            ->willReturnCallback(static function (array $batch): void {
+                self::assertNotEmpty($batch);
+                foreach ($batch as $task) {
+                    self::assertSame('test-current', $task->getEnvironment());
+                    self::assertSame('mock-external', $task->getExternalId());
+                }
             });
         $rules = $this->createMock(TaskSchedulerCrontabRepository::class);
+        $rules->method('lockById')->willReturn(clone $rule);
         $rules->expects(self::once())
-            ->method('save')
-            ->with(self::callback(static function (TaskSchedulerCrontab $saved) use ($lastGenTime): bool {
-                return $saved->getEnvironment() === '' && $saved->getLastGenTime() > $lastGenTime;
-            }));
+            ->method('updateGenerationTime')
+            ->with(456, self::callback(static fn (DateTime $time): bool => $time > $lastGenTime));
 
         $this->service($tasks, $rules)
             ->createByCrontab($rule, 1);

@@ -56,6 +56,24 @@ class TaskSchedulerRepository extends AbstractRepository
         }
     }
 
+    /**
+     * 在规则锁内一次查出本批已有时刻；取消项允许重新生成。
+     * @param DateTime[] $dates
+     * @return string[]
+     */
+    public function findExistingTimes(string $externalId, array $dates): array
+    {
+        if ($dates === []) {
+            return [];
+        }
+        $times = array_map(static fn (DateTime $date): string => $date->format('Y-m-d H:i:s'), $dates);
+        return $this->createBuilder(TaskSchedulerModel::query())
+            ->where('external_id', $externalId)
+            ->whereIn('expect_time', $times)
+            ->where('status', '!=', TaskSchedulerStatus::Canceled->value)
+            ->pluck('expect_time')->map(static fn ($time): string => (string) $time)->all();
+    }
+
     public function existsByExternalIdAndExpectTime(string $externalId, DateTime $expectTime): bool
     {
         return $this->createBuilder(TaskSchedulerModel::query())

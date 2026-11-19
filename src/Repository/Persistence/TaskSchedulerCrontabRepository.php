@@ -7,6 +7,7 @@ declare(strict_types=1);
 
 namespace Dtyq\TaskScheduler\Repository\Persistence;
 
+use DateTime;
 use Dtyq\TaskScheduler\Entity\Query\Page;
 use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerCrontabQuery;
 use Dtyq\TaskScheduler\Entity\TaskSchedulerCrontab;
@@ -15,6 +16,45 @@ use Dtyq\TaskScheduler\Repository\Persistence\Model\TaskSchedulerCrontabModel;
 
 class TaskSchedulerCrontabRepository extends AbstractRepository
 {
+    /**
+     * 在调用方事务内按现有环境范围锁定并重读规则。
+     */
+    public function lockById(int $id): ?TaskSchedulerCrontab
+    {
+        $model = $this->createBuilder(TaskSchedulerCrontabModel::query())->where('id', $id)->lockForUpdate()->first();
+        return $model === null ? null : TaskSchedulerCrontabFactory::modelToEntity($model);
+    }
+
+    /**
+     * 仅更新覆盖游标，不用调用方旧实体覆盖其他规则字段。
+     */
+    public function updateGenerationTime(int $id, DateTime $time): void
+    {
+        $this->createBuilder(TaskSchedulerCrontabModel::query())->where('id', $id)
+            ->update(['last_gen_time' => $time->format('Y-m-d H:i:s')]);
+    }
+
+    /**
+     * 按稳定 ID 游标扫描需要补充窗口的规则，跳过已过截止的规则。
+     * @return TaskSchedulerCrontab[]
+     */
+    public function listForGeneration(DateTime $lowWater, int $afterId, int $limit = 100): array
+    {
+        $models = $this->createBuilder(TaskSchedulerCrontabModel::query())
+            ->where('enabled', true)
+            ->where('id', '>', $afterId)
+            ->where('last_gen_time', '<=', $lowWater->format('Y-m-d H:i:s'))
+            ->where(static function ($query): void {
+                $query->whereNull('deadline')->orWhere('deadline', '>=', date('Y-m-d H:i:s'));
+            })
+            ->orderBy('id')->limit($limit)->get();
+        $rules = [];
+        foreach ($models as $model) {
+            $rules[] = TaskSchedulerCrontabFactory::modelToEntity($model);
+        }
+        return $rules;
+    }
+
     public function create(TaskSchedulerCrontab $crontab): TaskSchedulerCrontab
     {
         if ($this->existsByExternalIdAndCrontab($crontab->getExternalId(), $crontab->getCrontab())) {
