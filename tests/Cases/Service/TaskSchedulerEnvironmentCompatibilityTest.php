@@ -61,6 +61,7 @@ class TaskSchedulerEnvironmentCompatibilityTest extends EnvironmentTestCase
     {
         $this->setEnvironment();
         $rules = $this->createMock(TaskSchedulerCrontabRepository::class);
+        $rules->method('lockById')->willReturn($this->rule());
         $rules->expects(self::once())
             ->method('save')
             ->with(self::callback(static fn (TaskSchedulerCrontab $rule): bool => $rule->getEnvironment() === 'test-current'));

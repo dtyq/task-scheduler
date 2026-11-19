@@ -94,16 +94,86 @@ class TaskSchedulerDomainService
     /**
      * 修改定时调度.
      */
+    #[Transactional]
     public function saveCrontab(TaskSchedulerCrontab $scheduleTaskCrontab): void
     {
         $scheduleTaskCrontab->prepareForUpdate();
+        $previous = $this->scheduleTaskCrontabRepository->lockById($scheduleTaskCrontab->getId());
+        if ($previous === null || $previous->getExternalId() !== $scheduleTaskCrontab->getExternalId()) {
+            throw new TaskSchedulerParamsSchedulerException('规则不存在或业务标识不可修改');
+        }
+        if ($previous->getEnvironment() !== '' && $previous->getEnvironment() !== $scheduleTaskCrontab->getEnvironment()) {
+            throw new TaskSchedulerParamsSchedulerException('规则环境不可修改');
+        }
+        $changed = $previous->getCrontab() !== $scheduleTaskCrontab->getCrontab()
+            || $previous->isEnabled() !== $scheduleTaskCrontab->isEnabled()
+            || $previous->getDeadline()?->getTimestamp() !== $scheduleTaskCrontab->getDeadline()?->getTimestamp();
+        $scheduleTaskCrontab->setCreatedAt($previous->getCreatedAt());
+        if (! $changed) {
+            $scheduleTaskCrontab->setLastGenTime(clone $previous->getLastGenTime());
+            $this->scheduleTaskCrontabRepository->save($scheduleTaskCrontab);
+            $this->scheduleTaskRepository->updatePendingMetadata($scheduleTaskCrontab);
+            return;
+        }
+        $this->cancelPending([$previous->getExternalId()]);
+        $start = ScheduleRule::parse($scheduleTaskCrontab->getCrontab())->getStartTimestamp();
+        $scheduleTaskCrontab->setLastGenTime((new DateTime())->setTimestamp(max(time(), ($start ?? 0) - 1)));
         $this->scheduleTaskCrontabRepository->save($scheduleTaskCrontab);
+        if ($scheduleTaskCrontab->isEnabled()) {
+            $this->createByCrontab($scheduleTaskCrontab);
+        }
+    }
+
+    /**
+     * 批量暂停逻辑计划并取消未认领项，接入方保持一个业务标识对应一个活动计划。
+     */
+    #[Transactional]
+    public function pauseByExternalIds(array $externalIds): int
+    {
+        if ($externalIds === []) {
+            return 0;
+        }
+        if (count($externalIds) > 100) {
+            throw new TaskSchedulerParamsSchedulerException('单批暂停业务标识不得超过100个');
+        }
+        foreach ($externalIds as $externalId) {
+            if (! is_string($externalId) || $externalId === '') {
+                throw new TaskSchedulerParamsSchedulerException('业务标识必须为非空字符串');
+            }
+        }
+        $externalIds = array_values(array_unique($externalIds));
+        $rules = $this->scheduleTaskCrontabRepository->lockByExternalIds($externalIds);
+        $ids = array_map(static fn (TaskSchedulerCrontab $rule): int => $rule->getId(), $rules);
+        $this->scheduleTaskCrontabRepository->disableByIds($ids);
+        return $this->cancelPending($externalIds);
+    }
+
+    /**
+     * 纯预览复用运行规则，不修改生成游标或数据库。
+     * @return DateTime[]
+     */
+    public function previewCrontab(TaskSchedulerCrontab $rule, DateTime $after, int $limit = 3): array
+    {
+        return ScheduleRule::parse($rule->getCrontab())->preview($after, $limit, $rule->getDeadline());
+    }
+
+    /**
+     * 返回开启规则的下一时刻，暂停不等于任务自然完成。
+     */
+    public function getNextExecutionTime(TaskSchedulerCrontab $rule, ?DateTime $after = null): ?DateTime
+    {
+        if (! $rule->isEnabled()) {
+            return null;
+        }
+        return $this->previewCrontab($rule, $after ?? new DateTime(), 1)[0] ?? null;
     }
 
     // 清理scheduler 调度 和 crontab 规则
     #[Transactional]
     public function clearByExternalId(string $externalId): void
     {
+        $this->scheduleTaskCrontabRepository->lockByExternalIds([$externalId]);
+        // 原清理接口保持派生数据清理语义；安全启停使用pauseByExternalIds。
         // 清理 scheduler 调度
         $this->scheduleTaskRepository->clearByExternalId($externalId);
         // 清理 crontab 规则
@@ -114,6 +184,7 @@ class TaskSchedulerDomainService
     #[Transactional]
     public function clearTaskByExternalId(string $externalId): void
     {
+        $this->scheduleTaskCrontabRepository->lockByExternalIds([$externalId]);
         // 清理 scheduler 调度
         $this->scheduleTaskRepository->clearByExternalId($externalId);
     }
@@ -262,6 +333,32 @@ class TaskSchedulerDomainService
     public function existsByExternalId(string $externalId): bool
     {
         return $this->scheduleTaskCrontabRepository->existsByExternalId($externalId);
+    }
+
+    /**
+     * 按ID分批取消与归档日志，调用者已持有规则锁和外层事务。
+     */
+    private function cancelPending(array $externalIds): int
+    {
+        $afterId = 0;
+        $count = 0;
+        while (true) {
+            $tasks = $this->scheduleTaskRepository->cancelPendingBatch($externalIds, $afterId);
+            if ($tasks === []) {
+                return $count;
+            }
+            $logs = [];
+            foreach ($tasks as $task) {
+                $afterId = $task->getId();
+                $log = TaskSchedulerLogFactory::createByScheduleTask($task);
+                $log->prepareForCreation();
+                // 历史实例日志保留原环境，不将空环境伪造为当前环境。
+                $log->setEnvironment($task->getEnvironment());
+                $logs[] = $log;
+            }
+            $this->scheduleTaskLogRepository->batchCreate($logs);
+            $count += count($tasks);
+        }
     }
 
     /**

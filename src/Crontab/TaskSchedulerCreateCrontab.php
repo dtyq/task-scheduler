@@ -8,6 +8,7 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Crontab;
 
 use DateTime;
+use Dtyq\TaskScheduler\Exception\TaskSchedulerFrequencyException;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
 use Hyperf\Logger\LoggerFactory;
 use Psr\Log\LoggerInterface;
@@ -42,6 +43,14 @@ class TaskSchedulerCreateCrontab
                 $afterId = $rule->getId();
                 try {
                     $this->scheduleTaskDomainService->createByCrontab($rule, $days);
+                } catch (TaskSchedulerFrequencyException $throwable) {
+                    // 生成事务已回滚，独立暂停不可执行计划，避免每分钟重复生成。
+                    try {
+                        $this->scheduleTaskDomainService->pauseByExternalIds([$rule->getExternalId()]);
+                    } catch (Throwable $pauseError) {
+                        $this->logger->error('暂停不满足频率的调度失败', ['task_scheduler_id' => $rule->getId()]);
+                    }
+                    $this->logger->error('调度频率约束不满足', ['task_scheduler_id' => $rule->getId()]);
                 } catch (Throwable $throwable) {
                     $this->logger->notice('创建调度失败', [
                         'task_scheduler_id' => $rule->getId(),

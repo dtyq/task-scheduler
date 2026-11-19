@@ -55,10 +55,40 @@ class TaskSchedulerCrontabRepository extends AbstractRepository
         return $rules;
     }
 
+    /**
+     * 批量生命周期操作先按规则ID排序锁定，沿用当前环境范围。
+     * @return TaskSchedulerCrontab[]
+     */
+    public function lockByExternalIds(array $externalIds): array
+    {
+        if ($externalIds === []) {
+            return [];
+        }
+        $models = $this->createBuilder(TaskSchedulerCrontabModel::query())
+            ->whereIn('external_id', $externalIds)->orderBy('id')->lockForUpdate()->get();
+        $rules = [];
+        foreach ($models as $model) {
+            $rules[] = TaskSchedulerCrontabFactory::modelToEntity($model);
+        }
+        return $rules;
+    }
+
+    /**
+     * 在已取得的规则锁内批量暂停，不改变规则文本和游标。
+     */
+    public function disableByIds(array $ids): void
+    {
+        if ($ids !== []) {
+            $this->createBuilder(TaskSchedulerCrontabModel::query())->whereIn('id', $ids)->update(['enabled' => false]);
+        }
+    }
+
     public function create(TaskSchedulerCrontab $crontab): TaskSchedulerCrontab
     {
-        if ($this->existsByExternalIdAndCrontab($crontab->getExternalId(), $crontab->getCrontab())) {
-            return $crontab;
+        $existing = $this->createBuilder(TaskSchedulerCrontabModel::query())
+            ->where('external_id', $crontab->getExternalId())->where('crontab', $crontab->getCrontab())->first();
+        if ($existing !== null) {
+            return TaskSchedulerCrontabFactory::modelToEntity($existing);
         }
         $model = new TaskSchedulerCrontabModel();
         $model->fill($crontab->toModelArray());

@@ -63,7 +63,7 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        $rule = ScheduleRule::parse($this->crontab);
+        $rule = $this->parseScheduleRule();
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
             if ($rule->getStartTimestamp() !== null) {
@@ -105,7 +105,7 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        $rule = ScheduleRule::parse($this->crontab);
+        $rule = $this->parseScheduleRule();
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
             if ($rule->getStartTimestamp() !== null) {
@@ -141,7 +141,7 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        $rule = ScheduleRule::parse($this->crontab);
+        $rule = $this->parseScheduleRule();
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
             if ($rule->getStartTimestamp() !== null) {
@@ -345,6 +345,18 @@ class TaskSchedulerCrontab
         $this->filterId = $filterId;
 
         return $this;
+    }
+
+    /**
+     * 扩展规则的截止不得早于生效边界，裸规则保持历史校验行为。
+     */
+    private function parseScheduleRule(): ScheduleRule
+    {
+        $rule = ScheduleRule::parse($this->crontab);
+        if ($this->deadline !== null && $rule->getStartTimestamp() !== null && $this->deadline->getTimestamp() < $rule->getStartTimestamp()) {
+            throw new TaskSchedulerParamsSchedulerException('截止时间不能早于规则生效时间');
+        }
+        return $rule;
     }
 
     private function checkCallbackMethod(): void

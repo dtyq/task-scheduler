@@ -11,6 +11,7 @@ use DateTime;
 use Dtyq\TaskScheduler\Entity\Query\Page;
 use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerQuery;
 use Dtyq\TaskScheduler\Entity\TaskScheduler;
+use Dtyq\TaskScheduler\Entity\TaskSchedulerCrontab;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Factory\TaskSchedulerFactory;
 use Dtyq\TaskScheduler\Repository\Persistence\Model\TaskSchedulerModel;
@@ -136,6 +137,52 @@ class TaskSchedulerRepository extends AbstractRepository
             'total' => $total,
             'list' => $list,
         ];
+    }
+
+    /**
+     * 分批锁定并取消未认领实例，Running及终态均不进入取消集合。
+     * @return TaskScheduler[]
+     */
+    public function cancelPendingBatch(array $externalIds, int $afterId, int $limit = 500): array
+    {
+        if ($externalIds === []) {
+            return [];
+        }
+        $models = $this->createBuilder(TaskSchedulerModel::query())
+            ->whereIn('external_id', $externalIds)
+            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
+            ->where('id', '>', $afterId)->orderBy('id')->limit($limit)->lockForUpdate()->get();
+        $tasks = [];
+        foreach ($models as $model) {
+            $task = TaskSchedulerFactory::modelToEntity($model);
+            $task->setStatus(TaskSchedulerStatus::Canceled);
+            $tasks[] = $task;
+        }
+        $ids = array_map(static fn (TaskScheduler $task): int => $task->getId(), $tasks);
+        if ($ids !== []) {
+            $this->createBuilder(TaskSchedulerModel::query())->whereIn('id', $ids)
+                ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
+                ->update(['status' => TaskSchedulerStatus::Canceled->value]);
+        }
+        return $tasks;
+    }
+
+    /**
+     * 内容类修改同步未认领实例，不重新计算时间或改动生成游标。
+     */
+    public function updatePendingMetadata(TaskSchedulerCrontab $rule): void
+    {
+        $this->createBuilder(TaskSchedulerModel::query())
+            ->where('external_id', $rule->getExternalId())
+            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
+            ->update([
+                'name' => $rule->getName(),
+                'callback_method' => json_encode($rule->getCallbackMethod(), JSON_THROW_ON_ERROR),
+                'callback_params' => json_encode($rule->getCallbackParams(), JSON_THROW_ON_ERROR),
+                'retry_times' => $rule->getRetryTimes(),
+                'remark' => $rule->getRemark(),
+                'creator' => $rule->getCreator(),
+            ]);
     }
 
     public function cancelByIds(array $ids): void

@@ -8,6 +8,7 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Entity;
 
 use DateTime;
+use DateTimeInterface;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerExecuteResult;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Exception\TaskSchedulerParamsSchedulerException;
@@ -129,6 +130,24 @@ class TaskSchedulerLog
             'created_at' => $this->createdAt,
             'result' => $this->result?->toArray() ?? [],
         ];
+    }
+
+    /**
+     * 批量写入使用数据库原生值，避免逐日志调用模型保存。
+     */
+    public function toModelString(): array
+    {
+        $data = $this->toModelArray();
+        $data['type'] = $this->type;
+        foreach (['expect_time', 'actual_time', 'created_at'] as $field) {
+            if ($data[$field] instanceof DateTimeInterface) {
+                $data[$field] = $data[$field]->format('Y-m-d H:i:s');
+            }
+        }
+        foreach (['callback_method', 'callback_params', 'result'] as $field) {
+            $data[$field] = json_encode($data[$field], JSON_THROW_ON_ERROR);
+        }
+        return $data;
     }
 
     public function getId(): int
