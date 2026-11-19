@@ -7,8 +7,8 @@ declare(strict_types=1);
 
 namespace Dtyq\TaskScheduler\Entity;
 
-use Cron\CronExpression;
 use DateTime;
+use Dtyq\TaskScheduler\Entity\ValueObject\ScheduleRule;
 use Dtyq\TaskScheduler\Exception\TaskSchedulerParamsSchedulerException;
 use Dtyq\TaskScheduler\Util\Functions;
 
@@ -63,11 +63,12 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        if (! CronExpression::isValidExpression($this->crontab)) {
-            throw new TaskSchedulerParamsSchedulerException('定时规则 格式错误');
-        }
+        $rule = ScheduleRule::parse($this->crontab);
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
+            if ($rule->getStartTimestamp() !== null) {
+                $this->lastGenTime->setTimestamp($rule->getStartTimestamp() - 1);
+            }
         }
         if (! isset($this->enabled)) {
             throw new TaskSchedulerParamsSchedulerException('是否启用 不能为空');
@@ -104,11 +105,12 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        if (! CronExpression::isValidExpression($this->crontab)) {
-            throw new TaskSchedulerParamsSchedulerException('定时规则 格式错误');
-        }
+        $rule = ScheduleRule::parse($this->crontab);
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
+            if ($rule->getStartTimestamp() !== null) {
+                $this->lastGenTime->setTimestamp($rule->getStartTimestamp() - 1);
+            }
         }
         if (! isset($this->enabled)) {
             throw new TaskSchedulerParamsSchedulerException('是否启用 不能为空');
@@ -139,11 +141,12 @@ class TaskSchedulerCrontab
         if (empty($this->crontab)) {
             throw new TaskSchedulerParamsSchedulerException('定时规则 不能为空');
         }
-        if (! CronExpression::isValidExpression($this->crontab)) {
-            throw new TaskSchedulerParamsSchedulerException('定时规则 格式错误');
-        }
+        $rule = ScheduleRule::parse($this->crontab);
         if (empty($this->lastGenTime)) {
             $this->lastGenTime = new DateTime();
+            if ($rule->getStartTimestamp() !== null) {
+                $this->lastGenTime->setTimestamp($rule->getStartTimestamp() - 1);
+            }
         }
         if (! $this->enabled) {
             throw new TaskSchedulerParamsSchedulerException('未启用的定时任务不能生成调度任务');
@@ -160,19 +163,9 @@ class TaskSchedulerCrontab
         if ($endTime < $this->lastGenTime) {
             return [];
         }
-        $list = [];
-
-        $cron = new CronExpression($this->crontab);
-
-        $runDates = $cron->getMultipleRunDates($limit, $this->lastGenTime, false, false);
-        foreach ($runDates as $runDate) {
-            // 如果超过了结束时间，就不需要了
-            if ($runDate > $endTime) {
-                break;
-            }
-            $list[] = $runDate;
-            // 更新上次时间
-            $this->lastGenTime = $runDate;
+        $list = ScheduleRule::parse($this->crontab)->preview($this->lastGenTime, $limit, $endTime);
+        if ($list !== []) {
+            $this->lastGenTime = clone $list[array_key_last($list)];
         }
         return $list;
     }

@@ -150,3 +150,21 @@ create index task_scheduler_log_status_expect_time_index
 create index task_scheduler_log_task_id_index
     on task_scheduler_log (task_id);
 ```
+
+## 版本化计划规则
+
+规则仍保存在原 `crontab` 字段，最多 64 字符，无需修改表结构：
+
+| 文本 | 行为 |
+| --- | --- |
+| `0 9 * * 1-5` | 兼容旧 Cron 语法和原时区 |
+| `@every:v1:<interval_seconds>:<first_run_unix_seconds>` | 从首次绝对时刻按固定秒数推进，间隔为正整数分钟 |
+| `@cron:v1:<start_unix_seconds>:<minimum_seconds>:<timezone>:<expression>` | 在 IANA 时区解释标准五字段 Cron，保存生效边界及可选最小触发间隔 |
+
+通过 `ScheduleRule::every()`、`ScheduleRule::cron()` 构造，`toString()` 输出持久规则，`parse()` 读取规则。`nextAfter()` 严格返回游标之后的下一点，`preview()` 支持有界数量与包含边界的截止时间；结果统一转换到现有服务存储时区，不修改全局默认时区。新 Cron 仅支持数字、星号、列表、范围、步长及月份/星期英文名，不接受秒/年字段、宏或 L/W/#/?；旧裸 Cron 仍沿原解析库。
+
+`minimum_seconds=0` 表示不启用频率约束，包不设置产品级默认值。调用方负责用户身份、时区来源及产品政策，包不读取用户设置或套餐。超过 64 字符、非法版本、非整数或溢出参数明确拒绝；数字列表可等价压缩为范围，不截断或替换时区。
+
+`TaskConfigDomainService` 新增 `IntervalRepeat`、`CronRepeat` 及可选命名参数，使用 `getScheduleRule()` 获取新规则。间隔的 `includeStart` 默认 false，即从开始后的第一个间隔执行；true 使用开始时刻。旧 `getCrontabRule()` 继续只返回裸 Cron，单次仍沿原执行项入口。历史规则不批量改写，修改用户时区不自动改写已保存的规则。
+
+升级前先确保所有生成、预览和执行进程安装能识别新格式的版本，再开放新规则写入。回滚到旧版本前须停用新规则并处理未认领执行项，不支持将扩展文本直接交给旧 Cron 解析器。

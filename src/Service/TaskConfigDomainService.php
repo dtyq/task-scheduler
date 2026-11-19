@@ -11,14 +11,21 @@ use Cron\CronExpression;
 use DateTime;
 use Dtyq\TaskScheduler\Entity\TaskSchedulerValue;
 use Dtyq\TaskScheduler\Entity\ValueObject\IntervalUnit;
+use Dtyq\TaskScheduler\Entity\ValueObject\ScheduleRule;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskType;
 use Dtyq\TaskScheduler\Exception\TaskSchedulerParamsSchedulerException;
 use InvalidArgumentException;
 
+/**
+ * 将既有日历配置与新间隔/时区配置映射为调度规则。
+ */
 class TaskConfigDomainService
 {
     private string $crontabRule = '';
 
+    /**
+     * 兼容旧参数顺序，新计划通过追加命名参数提供。
+     */
     public function __construct(
         // 定时类型
         private readonly TaskType $type,
@@ -34,12 +41,58 @@ class TaskConfigDomainService
         private ?array $values = null,
         // 结束日期，该日期后不生成数据
         private readonly ?DateTime $deadline = null,
+        private readonly ?DateTime $startAt = null,
+        private readonly ?int $intervalSeconds = null,
+        private readonly bool $includeStart = false,
+        private readonly ?string $cron = null,
+        private readonly ?string $timezone = null,
+        private readonly int $minimumIntervalSeconds = 0,
     ) {
+        if ($this->type === TaskType::IntervalRepeat) {
+            $start = $this->startAt === null ? new DateTime(date('Y-m-d H:i:00')) : clone $this->startAt;
+            $interval = $this->intervalSeconds ?? 0;
+            if ($interval <= 0 || $interval % 60 !== 0) {
+                throw new InvalidArgumentException('间隔必须为正整数分钟');
+            }
+            if ($this->minimumIntervalSeconds < 0 || $interval < $this->minimumIntervalSeconds) {
+                throw new InvalidArgumentException('间隔不满足配置的最小间隔');
+            }
+            if (! $this->includeStart) {
+                if ($start->getTimestamp() > PHP_INT_MAX - $interval) {
+                    throw new InvalidArgumentException('首次执行时间超出整数范围');
+                }
+                $start->setTimestamp($start->getTimestamp() + $interval);
+            }
+            $this->crontabRule = ScheduleRule::every($interval, $start)->toString();
+            return;
+        }
+        if ($this->type === TaskType::CronRepeat) {
+            if ($this->cron === null || $this->timezone === null) {
+                throw new InvalidArgumentException('Cron表达式和时区不能为空');
+            }
+            $this->crontabRule = ScheduleRule::cron($this->cron, $this->startAt ?? new DateTime(), $this->timezone, $this->minimumIntervalSeconds)->toString();
+            return;
+        }
         $this->validate();
+    }
+
+    /**
+     * 新旧计划统一输出持久规则，单次仍使用 getDatetime。
+     */
+    public function getScheduleRule(): string
+    {
+        return $this->isExtendedType() ? $this->crontabRule : $this->getCrontabRule();
     }
 
     public function toConfigArray(): array
     {
+        if ($this->isExtendedType()) {
+            return [
+                'type' => $this->type->value,
+                'rule' => $this->crontabRule,
+                'deadline' => $this->deadline?->format('Y-m-d H:i:s'),
+            ];
+        }
         return [
             'type' => $this->type->value,
             'day' => $this->day,
@@ -61,6 +114,9 @@ class TaskConfigDomainService
     // 传入参数判断是否需要不重复的定时任务
     public function getCrontabRule(bool $isNoRepeat = false): string
     {
+        if ($this->isExtendedType()) {
+            throw new InvalidArgumentException('扩展计划请使用getScheduleRule');
+        }
         if (! empty($this->crontabRule)) {
             return $this->crontabRule;
         }
@@ -310,6 +366,14 @@ class TaskConfigDomainService
             throw new TaskSchedulerParamsSchedulerException('未能生成任何定时任务,请检查配置');
         }
         return $expectTimes;
+    }
+
+    /**
+     * 判断是否需要版本化规则，避免旧 Cron 接口误返回扩展文本。
+     */
+    private function isExtendedType(): bool
+    {
+        return in_array($this->type, [TaskType::IntervalRepeat, TaskType::CronRepeat], true);
     }
 
     private function validate(): void

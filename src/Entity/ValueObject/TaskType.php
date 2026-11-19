@@ -52,6 +52,16 @@ enum TaskType: string
      */
     case CustomRepeat = 'custom_repeat';
 
+    /**
+     * 固定秒数间隔，分钟精度。
+     */
+    case IntervalRepeat = 'interval_repeat';
+
+    /**
+     * 带生效边界及任务时区的标准 Cron。
+     */
+    case CronRepeat = 'cron_repeat';
+
     public function needDay(): bool
     {
         return in_array($this, [
