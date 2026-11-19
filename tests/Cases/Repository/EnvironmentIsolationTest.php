@@ -260,6 +260,65 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
     }
 
     /**
+     * 真实查询构造器验证条件认领SQL及受影响行数，不连接数据库。
+     */
+    #[DataProvider('claimCases')]
+    public function testClaimUsesStatusGuardAndAffectedRows(bool $includeEmpty, int $affected): void
+    {
+        $this->setEnvironment();
+        $this->config->set('task_scheduler.include_empty_environment', $includeEmpty);
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings) use ($includeEmpty, $affected): int {
+            self::assertStringContainsString('`id` = ?', $sql);
+            self::assertStringContainsString('`status` in (?, ?)', $sql);
+            self::assertStringContainsString($includeEmpty ? '`environment` in (?, ?)' : '`environment` = ?', $sql);
+            self::assertSame([TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value], array_slice($bindings, -2));
+            self::assertSame(TaskSchedulerStatus::Running->value, $bindings[0]);
+            return $affected;
+        });
+        self::assertSame($affected === 1, (new TaskSchedulerRepository())->claimForExecution(123));
+    }
+
+    /**
+     * 严格及历史兼容环境下都覆盖认领胜出和失败。
+     */
+    public static function claimCases(): array
+    {
+        return [[false, 0], [false, 1], [true, 0], [true, 1]];
+    }
+
+    /**
+     * 规则锁必须带环境且使用for update，不能仅靠进程内对象模拟互斥。
+     */
+    public function testGenerationLockUsesScopedCurrentRead(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertStringContainsString('for update', $sql);
+            self::assertStringContainsString('`environment` = ?', $sql);
+            self::assertSame(['test-current', 123], $bindings);
+            return [];
+        });
+        self::assertNull((new TaskSchedulerCrontabRepository())->lockById(123));
+    }
+
+    /**
+     * 认领后的错误处理不能覆盖已提交结果，只允许Running转Failed。
+     */
+    public function testFailureUpdateOnlyTouchesRunning(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('update')->willReturnCallback(static function (string $sql, array $bindings): int {
+            self::assertSame([TaskSchedulerStatus::Failed->value, 'test-current', 123, TaskSchedulerStatus::Running->value], $bindings);
+            self::assertStringContainsString('`id` = ? and `status` = ?', $sql);
+            return 0;
+        });
+        (new TaskSchedulerRepository())->markRunningFailed(123);
+    }
+
+    /**
      * 给真实 Model 装配 Mock 连接和容器，SQL 仅交给 Mock 回调。
      */
     private function connection(): ConnectionInterface

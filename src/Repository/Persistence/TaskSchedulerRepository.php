@@ -185,13 +185,82 @@ class TaskSchedulerRepository extends AbstractRepository
             ]);
     }
 
+    /**
+     * 以单条条件更新认领，Redis租约到期后也只允许一个执行者成功。
+     */
+    public function claimForExecution(int $id): bool
+    {
+        return $this->createBuilder(TaskSchedulerModel::query())->where('id', $id)
+            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
+            ->update(['status' => TaskSchedulerStatus::Running->value]) === 1;
+    }
+
+    /**
+     * 只标记本次尚未持久化结果的运行项，不覆盖已提交成功或取消状态。
+     */
+    public function markRunningFailed(int $id): void
+    {
+        $this->createBuilder(TaskSchedulerModel::query())->where('id', $id)
+            ->where('status', TaskSchedulerStatus::Running->value)
+            ->update(['status' => TaskSchedulerStatus::Failed->value]);
+    }
+
+    /**
+     * 原扫描仍只处理Pending，以ID游标避免认领导致offset跳项。
+     * @return TaskScheduler[]
+     */
+    public function listForExecution(DateTime $cutoff, int $afterId, int $limit = 200): array
+    {
+        $models = $this->createBuilder(TaskSchedulerModel::query())
+            ->where('status', TaskSchedulerStatus::Pending->value)
+            ->where('expect_time', '<=', $cutoff->format('Y-m-d H:i:s'))
+            ->where('id', '>', $afterId)->orderBy('id')->limit($limit)->get();
+        $tasks = [];
+        foreach ($models as $model) {
+            $tasks[] = TaskSchedulerFactory::modelToEntity($model);
+        }
+        return $tasks;
+    }
+
+    /**
+     * 旧取消入口先锁定实际可取消项，避免查后认领导致虚假的取消日志。
+     * @return TaskScheduler[]
+     */
+    public function lockCancelable(TaskSchedulerQuery $query): array
+    {
+        if ($query->getIds() === [] && $query->getExternalIds() === []) {
+            return [];
+        }
+        $builder = $this->createBuilder(TaskSchedulerModel::query())
+            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value]);
+        if ($query->getIds() !== []) {
+            $builder->whereIn('id', $query->getIds());
+        }
+        if ($query->getExternalIds() !== []) {
+            $builder->whereIn('external_id', $query->getExternalIds());
+        }
+        if ($query->getExpectTimeLt() !== null) {
+            $builder->where('expect_time', '<=', $query->getExpectTimeLt()->format('Y-m-d H:i:s'));
+        }
+        if ($query->getStatus() !== null) {
+            $builder->where('status', $query->getStatus()->value);
+        }
+        $tasks = [];
+        foreach ($builder->orderBy('id')->limit(500)->lockForUpdate()->get() as $model) {
+            $tasks[] = TaskSchedulerFactory::modelToEntity($model);
+        }
+        return $tasks;
+    }
+
     public function cancelByIds(array $ids): void
     {
         if (empty($ids)) {
             return;
         }
         $ids = array_values(array_unique($ids));
-        $this->createBuilder(TaskSchedulerModel::query())->whereIn('id', $ids)->update(['status' => TaskSchedulerStatus::Canceled->value]);
+        $this->createBuilder(TaskSchedulerModel::query())->whereIn('id', $ids)
+            ->whereIn('status', [TaskSchedulerStatus::Pending->value, TaskSchedulerStatus::Retry->value])
+            ->update(['status' => TaskSchedulerStatus::Canceled->value]);
     }
 
     public function deleteByIds(array $clearIds): void
@@ -216,7 +285,7 @@ class TaskSchedulerRepository extends AbstractRepository
     {
         /** @var TaskSchedulerModel $model */
         $model = $this->createBuilder(TaskSchedulerModel::query())->find($id);
-        return TaskSchedulerFactory::modelToEntity($model);
+        return $model === null ? null : TaskSchedulerFactory::modelToEntity($model);
     }
 
     public function clearByExternalId(string $externalId): void

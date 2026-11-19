@@ -270,11 +270,18 @@ class TaskSchedulerDomainService
      */
     public function execute(TaskScheduler $scheduleTask): TaskSchedulerExecuteResult
     {
-        $this->logger->info('execute_task_scheduler_start', ['id' => $scheduleTask->getId()]);
         $scheduleTask->prepareForExecution();
+        if (! $this->scheduleTaskRepository->claimForExecution($scheduleTask->getId())) {
+            $skipped = new TaskSchedulerExecuteResult();
+            $skipped->setSuccess(false);
+            $skipped->setCosTime(0);
+            $skipped->setErrorMessage('任务已被认领、取消或移除');
+            return $skipped;
+        }
+        $scheduleTask->setStatus(TaskSchedulerStatus::Running);
+        $this->logger->info('execute_task_scheduler_start', ['id' => $scheduleTask->getId()]);
 
         try {
-            $this->scheduleTaskRepository->changeStatus($scheduleTask->getId(), TaskSchedulerStatus::Running);
             $result = $scheduleTask->execute();
             if ($result->isSuccess()) {
                 $scheduleTask->setStatus(TaskSchedulerStatus::Success);
@@ -290,10 +297,10 @@ class TaskSchedulerDomainService
             }
             $this->scheduleTaskRepository->save($scheduleTask);
             $this->createLog($scheduleTask, $result);
-            $this->logger->info('execute_task_scheduler_success', ['id' => $scheduleTask->getId(), 'result' => $result->toArray()]);
+            $this->logger->info('execute_task_scheduler_success', ['id' => $scheduleTask->getId(), 'success' => $result->isSuccess(), 'cost_time' => $result->getCosTime()]);
         } catch (Throwable $throwable) {
-            $this->scheduleTaskRepository->changeStatus($scheduleTask->getId(), TaskSchedulerStatus::Failed);
-            $this->logger->error('execute_task_scheduler_fail', ['id' => $scheduleTask->getId(), 'exception' => $throwable->getMessage()]);
+            $this->scheduleTaskRepository->markRunningFailed($scheduleTask->getId());
+            $this->logger->error('execute_task_scheduler_fail', ['id' => $scheduleTask->getId(), 'exception_type' => get_class($throwable)]);
             throw $throwable;
         }
         return $result;
@@ -311,18 +318,25 @@ class TaskSchedulerDomainService
         if (count($query->getIds()) > 100 || count($query->getExternalIds()) > 100) {
             throw new TaskSchedulerParamsSchedulerException('Too many ids to cancel');
         }
-        $data = $this->queries($query, new Page(1, 500));
+        $tasks = $this->scheduleTaskRepository->lockCancelable($query);
         $cancelIds = [];
-        foreach ($data['list'] as $task) {
+        foreach ($tasks as $task) {
             $task->prepareForCancel();
+            $task->setStatus(TaskSchedulerStatus::Canceled);
             $cancelIds[] = $task->getId();
         }
-
         $this->scheduleTaskRepository->cancelByIds($cancelIds);
-        foreach ($data['list'] as $task) {
-            $this->createLog($task);
-        }
+        $this->createCancellationLogs($tasks);
         $this->logger->info('cancel_task_scheduler', ['ids' => $cancelIds]);
+    }
+
+    /**
+     * 执行器按固定截止和ID游标读取候选，实际认领仍由数据库条件更新决定。
+     * @return TaskScheduler[]
+     */
+    public function listTasksForExecution(DateTime $cutoff, int $afterId, int $limit = 200): array
+    {
+        return $this->scheduleTaskRepository->listForExecution($cutoff, $afterId, $limit);
     }
 
     public function deleteByIds(array $clearIds): void
@@ -347,17 +361,27 @@ class TaskSchedulerDomainService
             if ($tasks === []) {
                 return $count;
             }
-            $logs = [];
-            foreach ($tasks as $task) {
-                $afterId = $task->getId();
-                $log = TaskSchedulerLogFactory::createByScheduleTask($task);
-                $log->prepareForCreation();
-                // 历史实例日志保留原环境，不将空环境伪造为当前环境。
-                $log->setEnvironment($task->getEnvironment());
-                $logs[] = $log;
-            }
-            $this->scheduleTaskLogRepository->batchCreate($logs);
+            $afterId = $tasks[array_key_last($tasks)]->getId();
+            $this->createCancellationLogs($tasks);
             $count += count($tasks);
+        }
+    }
+
+    /**
+     * 两种取消入口共用日志装配，保留实例原始环境与状态。
+     * @param TaskScheduler[] $tasks
+     */
+    private function createCancellationLogs(array $tasks): void
+    {
+        $logs = [];
+        foreach ($tasks as $task) {
+            $log = TaskSchedulerLogFactory::createByScheduleTask($task);
+            $log->prepareForCreation();
+            $log->setEnvironment($task->getEnvironment());
+            $logs[] = $log;
+        }
+        if ($logs !== []) {
+            $this->scheduleTaskLogRepository->batchCreate($logs);
         }
     }
 

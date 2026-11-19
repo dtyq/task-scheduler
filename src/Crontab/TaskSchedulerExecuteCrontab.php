@@ -8,8 +8,6 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Crontab;
 
 use DateTime;
-use Dtyq\TaskScheduler\Entity\Query\Page;
-use Dtyq\TaskScheduler\Entity\Query\TaskSchedulerQuery;
 use Dtyq\TaskScheduler\Entity\TaskScheduler;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
@@ -42,29 +40,18 @@ class TaskSchedulerExecuteCrontab
 
     public function execute(): void
     {
-        // 获取已经超过了调度时间，还未开始的任务进行执行
-        $query = new TaskSchedulerQuery();
-        $query->setExpectTimeLt(new DateTime());
-        $query->setStatus(TaskSchedulerStatus::Pending);
-        $page = new Page(1, 200);
-        $limitPage = 1000;
-        while (true) {
-            $data = $this->scheduleTaskDomainService->queries($query, $page);
-            $list = $data['list'] ?? [];
-            if (empty($list)) {
+        $cutoff = new DateTime();
+        $afterId = 0;
+        for ($batch = 0; $batch < 1000; ++$batch) {
+            $tasks = $this->scheduleTaskDomainService->listTasksForExecution($cutoff, $afterId, 200);
+            if ($tasks === []) {
                 break;
             }
-            foreach ($list as $scheduleTask) {
-                $this->concurrent->create(function () use ($scheduleTask) {
-                    $this->run($scheduleTask);
+            foreach ($tasks as $task) {
+                $afterId = $task->getId();
+                $this->concurrent->create(function () use ($task): void {
+                    $this->run($task);
                 });
-            }
-            if ($data['total'] <= $page->getPageNum() * $page->getPage()) {
-                break;
-            }
-            $page->setNextPage();
-            if ($page->getPage() > $limitPage) {
-                break;
             }
         }
     }
@@ -82,7 +69,7 @@ class TaskSchedulerExecuteCrontab
 
             // 实时查询最新数据
             $taskScheduler = $this->scheduleTaskDomainService->getById($taskScheduler->getId());
-            if (! $taskScheduler) {
+            if (! $taskScheduler || ! in_array($taskScheduler->getStatus(), [TaskSchedulerStatus::Pending, TaskSchedulerStatus::Retry], true)) {
                 return;
             }
             $this->scheduleTaskDomainService->execute($taskScheduler);
