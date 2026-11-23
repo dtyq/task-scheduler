@@ -10,10 +10,31 @@ namespace Dtyq\TaskScheduler;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerClearCrontab;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerCreateCrontab;
 use Dtyq\TaskScheduler\Crontab\TaskSchedulerExecuteCrontab;
+use Dtyq\TaskScheduler\Entity\ValueObject\ExecutionStaggerRuleSet;
 use Hyperf\Crontab\Crontab;
+
+use function Hyperf\Support\env;
 
 class ConfigProvider
 {
+    /**
+     * 是否注册错峰快扫入口。加载 ConfigProvider 时运行时配置尚未就绪，只能读环境变量；
+     * 接入方的 task_scheduler.stagger.enabled 应引用同一个环境变量。
+     */
+    public static function staggerScanEnabled(): bool
+    {
+        return filter_var(env('TASK_SCHEDULER_STAGGER_ENABLED', false), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * 错峰快扫入口的基础 tick（秒），非法时回落默认值；接入方的 tick_seconds 应引用同一个环境变量。
+     */
+    public static function staggerTickSeconds(): int
+    {
+        $tick = filter_var(env('TASK_SCHEDULER_STAGGER_TICK_SECONDS', ExecutionStaggerRuleSet::DEFAULT_TICK_SECONDS), FILTER_VALIDATE_INT);
+        return ExecutionStaggerRuleSet::isValidTick($tick) ? $tick : ExecutionStaggerRuleSet::DEFAULT_TICK_SECONDS;
+    }
+
     public function __invoke(): array
     {
         $appEnv = '';
@@ -57,6 +78,15 @@ class ConfigProvider
                         ->setMutexExpires(90)
                         ->setOnOneServer(true)
                         ->setMemo('执行调度'),
+                    (new Crontab())
+                        ->setName($appEnv . '.TaskSchedulerStaggerExecuteCrontab')
+                        ->setRule('*/' . self::staggerTickSeconds() . ' * * * * *')
+                        ->setCallback([TaskSchedulerExecuteCrontab::class, 'executeStaggered'])
+                        ->setSingleton(true)
+                        ->setMutexExpires(30)
+                        ->setOnOneServer(true)
+                        ->setEnable(self::staggerScanEnabled())
+                        ->setMemo('按回调规则错峰的快速扫描'),
                 ],
             ],
             'publish' => [

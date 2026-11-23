@@ -407,9 +407,9 @@ class TaskSchedulerDomainService
      * 执行器按固定截止和ID游标读取候选，实际认领仍由数据库条件更新决定。
      * @return TaskScheduler[]
      */
-    public function listTasksForExecution(DateTime $cutoff, int $afterId, int $limit = 200): array
+    public function listTasksForExecution(DateTime $cutoff, int $afterId, int $limit = 200, ?DateTime $notBefore = null): array
     {
-        return $this->scheduleTaskRepository->listForExecution($cutoff, $afterId, $limit);
+        return $this->scheduleTaskRepository->listForExecution($cutoff, $afterId, $limit, $notBefore);
     }
 
     public function deleteByIds(array $clearIds): void

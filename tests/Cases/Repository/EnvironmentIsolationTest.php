@@ -426,6 +426,36 @@ class EnvironmentIsolationTest extends EnvironmentTestCase
     /**
      * 给真实 Model 装配 Mock 连接和容器，SQL 仅交给 Mock 回调。
      */
+    /**
+     * 不传下界时执行扫描 SQL 与原实现一致。
+     */
+    public function testExecutionScanWithoutLowerBoundKeepsOriginalSql(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertSame('select * from `task_scheduler` where `environment` = ? and `status` = ? and `expect_time` <= ? and `id` > ? order by `id` asc limit 200', $sql);
+            self::assertSame(['test-current', TaskSchedulerStatus::Pending->value, '2030-01-01 08:02:00', 5], $bindings);
+            return [];
+        });
+        self::assertSame([], (new TaskSchedulerRepository())->listForExecution(new DateTime('2030-01-01 08:02:00'), 5));
+    }
+
+    /**
+     * 错峰快扫的下界只追加 expect_time 范围条件，保留环境、状态与游标。
+     */
+    public function testExecutionScanWithLowerBoundAddsRange(): void
+    {
+        $this->setEnvironment();
+        $connection = $this->connection();
+        $connection->expects(self::once())->method('select')->willReturnCallback(static function (string $sql, array $bindings): array {
+            self::assertSame('select * from `task_scheduler` where `environment` = ? and `status` = ? and `expect_time` <= ? and `expect_time` >= ? and `id` > ? order by `id` asc limit 200', $sql);
+            self::assertSame(['test-current', TaskSchedulerStatus::Pending->value, '2030-01-01 08:02:00', '2030-01-01 07:58:00', 0], $bindings);
+            return [];
+        });
+        self::assertSame([], (new TaskSchedulerRepository())->listForExecution(new DateTime('2030-01-01 08:02:00'), 0, 200, new DateTime('2030-01-01 07:58:00')));
+    }
+
     private function connection(): ConnectionInterface
     {
         $connection = $this->createMock(Connection::class);

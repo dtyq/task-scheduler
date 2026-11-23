@@ -8,7 +8,10 @@ declare(strict_types=1);
 namespace Dtyq\TaskScheduler\Crontab;
 
 use DateTime;
+use Dtyq\TaskScheduler\ConfigProvider;
 use Dtyq\TaskScheduler\Entity\TaskScheduler;
+use Dtyq\TaskScheduler\Entity\ValueObject\ExecutionStaggerRule;
+use Dtyq\TaskScheduler\Entity\ValueObject\ExecutionStaggerRuleSet;
 use Dtyq\TaskScheduler\Entity\ValueObject\TaskSchedulerStatus;
 use Dtyq\TaskScheduler\Service\TaskSchedulerDomainService;
 use Dtyq\TaskScheduler\Util\Locker;
@@ -21,11 +24,27 @@ use function Hyperf\Config\config;
 
 class TaskSchedulerExecuteCrontab
 {
+    /**
+     * 快扫下界在最大窗口之外再多看的秒数，覆盖分钟入口的扫描间隔与时钟误差，
+     * 保证两个入口交接处的任务至少被其中一个扫到。
+     */
+    private const STAGGER_LOOKBACK_SECONDS = 120;
+
     protected Concurrent $concurrent;
 
     private LoggerInterface $logger;
 
     private array $config;
+
+    /**
+     * 错峰规则集；为 null 时等同于未启用错峰。
+     */
+    private ?ExecutionStaggerRuleSet $staggerRules = null;
+
+    /**
+     * 快扫入口独立的协程池，避免分钟扫描积压时挤占快扫名额。
+     */
+    private ?Concurrent $staggerConcurrent = null;
 
     public function __construct(
         private readonly TaskSchedulerDomainService $scheduleTaskDomainService,
@@ -36,6 +55,10 @@ class TaskSchedulerExecuteCrontab
         $this->logger = $this->loggerFactory->get('task_scheduler');
         $limit = (int) ($this->config['concurrent_limit'] ?? 500);
         $this->concurrent = new Concurrent(max($limit, 1));
+        $this->staggerRules = $this->buildStaggerRules();
+        if ($this->staggerRules !== null) {
+            $this->staggerConcurrent = new Concurrent(max($limit, 1));
+        }
     }
 
     public function execute(): void
@@ -43,6 +66,7 @@ class TaskSchedulerExecuteCrontab
         $cutoff = new DateTime();
         $this->recoverRunning($cutoff);
         $afterId = 0;
+        $deferred = 0;
         for ($batch = 0; $batch < 1000; ++$batch) {
             $tasks = $this->scheduleTaskDomainService->listTasksForExecution($cutoff, $afterId, 200);
             if ($tasks === []) {
@@ -50,11 +74,94 @@ class TaskSchedulerExecuteCrontab
             }
             foreach ($tasks as $task) {
                 $afterId = $task->getId();
+                // 命中错峰规则但未到有效时刻的任务保持 Pending，交给快扫或后续分钟扫描。
+                if (! $this->isDue($task, $cutoff)) {
+                    ++$deferred;
+                    continue;
+                }
                 $this->concurrent->create(function () use ($task): void {
                     $this->run($task);
                 });
             }
         }
+        if ($deferred > 0) {
+            $this->logger->debug('分钟扫描跳过未到错峰时刻的任务', ['count' => $deferred]);
+        }
+    }
+
+    /**
+     * 错峰快扫入口：按基础 tick 触发，只处理本 tick 需要扫描的规则下已到有效时刻的任务。
+     * 不做 Running 维护，Running 维护仍只由分钟入口负责。
+     */
+    public function executeStaggered(): void
+    {
+        $rules = $this->staggerRules;
+        if ($rules === null || ! $rules->isEnabled() || $this->staggerConcurrent === null) {
+            return;
+        }
+        $now = new DateTime();
+        $scanRules = $rules->rulesToScanAt($rules->tickSlot($now->getTimestamp()));
+        if ($scanRules === []) {
+            return;
+        }
+        $maxWindow = max(array_map(static fn (ExecutionStaggerRule $rule): int => $rule->getWindowSeconds(), $scanRules));
+        $notBefore = (clone $now)->setTimestamp($now->getTimestamp() - $maxWindow - self::STAGGER_LOOKBACK_SECONDS);
+
+        $afterId = 0;
+        $deferred = 0;
+        for ($batch = 0; $batch < 1000; ++$batch) {
+            $tasks = $this->scheduleTaskDomainService->listTasksForExecution($now, $afterId, 200, $notBefore);
+            if ($tasks === []) {
+                break;
+            }
+            foreach ($tasks as $task) {
+                $afterId = $task->getId();
+                // 回调不在 SQL 中筛选，未命中本 tick 规则的任务交给分钟入口。
+                $rule = $rules->ruleFor($task);
+                if ($rule === null || ! isset($scanRules[$rule->getCallbackKey()])) {
+                    continue;
+                }
+                if (! $rules->isDue($task, $now)) {
+                    ++$deferred;
+                    continue;
+                }
+                $this->staggerConcurrent->create(function () use ($task): void {
+                    $this->run($task);
+                });
+            }
+        }
+        if ($deferred > 0) {
+            $this->logger->debug('错峰快扫中尚未到有效时刻的任务', ['count' => $deferred]);
+        }
+    }
+
+    /**
+     * 构建错峰规则集，没有有效规则时返回 null；配置问题汇总记录一次，不按任务刷日志。
+     */
+    private function buildStaggerRules(): ?ExecutionStaggerRuleSet
+    {
+        $rules = ExecutionStaggerRuleSet::fromConfig((array) ($this->config['stagger'] ?? []));
+        if ($rules->getProblems() !== []) {
+            $this->logger->warning('错峰配置存在问题，相关规则已忽略', ['problems' => $rules->getProblems()]);
+        }
+        if (! $rules->isEnabled()) {
+            return null;
+        }
+        if ($rules->getTickSeconds() !== ConfigProvider::staggerTickSeconds()) {
+            $this->logger->warning('错峰 tick_seconds 与快扫入口注册频率不一致，跳拍按配置值计算', [
+                'tick_seconds' => $rules->getTickSeconds(),
+                'registered_tick_seconds' => ConfigProvider::staggerTickSeconds(),
+            ]);
+        }
+        return $rules;
+    }
+
+    /**
+     * 未启用错峰时，扫描结果本身已满足计划时间到期。
+     */
+    private function isDue(TaskScheduler $task, DateTime $now): bool
+    {
+        return $this->staggerRules === null || $this->staggerRules->isDue($task, $now);
     }
 
     /**
@@ -126,6 +233,10 @@ class TaskSchedulerExecuteCrontab
             // 实时查询最新数据
             $taskScheduler = $this->scheduleTaskDomainService->getById($taskScheduler->getId());
             if (! $taskScheduler || ! in_array($taskScheduler->getStatus(), [TaskSchedulerStatus::Pending, TaskSchedulerStatus::Retry], true)) {
+                return;
+            }
+            // 以重读后的任务为准再确认一次有效时刻，未到期则保持 Pending。
+            if (! $this->isDue($taskScheduler, new DateTime())) {
                 return;
             }
             $this->scheduleTaskDomainService->execute($taskScheduler);

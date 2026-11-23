@@ -205,3 +205,33 @@ create index task_scheduler_log_task_id_index
 - 完成或异常更新必须匹配当前Running及本轮actual_time。恢复清空旧批次时间后，旧回调迟到不得覆盖新状态或写入旧结果日志。Redis所有者逐次唯一，未获得锁不释放别人的租约。
 
 超时并不证明旧回调已停止，自动恢复允许重复业务触发，外部副作用的幂等仍由业务接入负责。全部执行器升级后再开启恢复；旧版本无条件保存结果不受新批次校验保护。服务存储时区继续原统一口径，用户Cron时区不改变该存储语义。未通过容器事务切面或绕过统一入口时，不具备本文的状态/日志原子保证。
+
+### 按回调错峰执行
+
+同一时刻到期的大量任务会在同一分钟被一起认领，回调背后的资源（例如创建容器）会出现瞬时高峰。错峰规则让命中指定回调的任务在 `expect_time` 后再等待一个稳定偏移才认领，把高峰摊开。默认关闭、没有规则，未命中规则的任务行为不变。
+
+配置位于 `task_scheduler.stagger`（见 `publish/task_scheduler.php`）：
+
+```php
+'stagger' => [
+    'enabled' => (bool) env('TASK_SCHEDULER_STAGGER_ENABLED', false),
+    'tick_seconds' => (int) env('TASK_SCHEDULER_STAGGER_TICK_SECONDS', 5),
+    'rules' => [
+        [
+            'callback' => [DemoAppService::class, 'demoCallback'],
+            'window_seconds' => 120,      // 打散窗口，0～600
+            'scan_interval_seconds' => 5, // 快扫间隔，tick 的整数倍，最大 60
+        ],
+    ],
+],
+```
+
+- 匹配：按创建任务时的 `callback_method` 匹配，类名开头的 `\` 和大小写不影响；每个回调最多一条规则。
+- 偏移：`crc32(external_id) % (window_seconds + 1)`。同一任务跨日、跨进程重启偏移不变；偏移不落库，`expect_time` 不变。修改窗口会改变待执行实例的偏移，不要在高峰中途调整。
+- 扫描：`TaskSchedulerStaggerExecuteCrontab` 按基础 tick 触发（`*/tick` 秒级规则），每条规则在 `tick 时刻 % scan_interval_seconds == 0` 时参与扫描，不记录进程内状态。快扫只读取 `expect_time` 在“最大窗口 + 120 秒”之内的 Pending 任务，回调在 PHP 中匹配；更早到期的任务由分钟入口处理。快扫不做 Running 维护，使用独立协程池。
+- 分钟入口：照常扫描，但跳过命中规则且未到有效时刻的任务；快扫入口缺失时它是兜底，最多多等约 60 秒，不会漏执行。拿到任务锁并重读后会再确认一次有效时刻。
+- 注册：加载 `ConfigProvider` 时运行时配置尚未就绪，快扫入口是否注册及其频率只读环境变量 `TASK_SCHEDULER_STAGGER_ENABLED`、`TASK_SCHEDULER_STAGGER_TICK_SECONDS`，`stagger.enabled` 与 `tick_seconds` 应引用同一组变量。两者不一致时不会漏执行；tick 不一致会记录警告。
+- 互斥：快扫入口与分钟入口名称不同，可以并行；同一任务由 Redis 锁与数据库条件认领保证只回调一次。快扫的单例锁过期时间为 30 秒，单次扫描超过一个 tick 时后续 tick 会被跳过。
+- 配置校验：tick 不合法时整体关闭；单条规则不合法或回调重复时只丢弃该条，问题在执行器初始化时汇总记录一次。
+
+错峰不是积压限速：停机超过窗口后恢复，已过有效时刻的任务仍会一起执行。关闭错峰会让等待中的任务立即到期，应避开高峰操作。

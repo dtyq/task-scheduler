@@ -28,4 +28,28 @@ return [
 
     // 锁超时时间
     'lock_timeout' => 600,
+
+    // 按回调方法错峰执行：命中规则的任务到 expect_time 后，再等一个稳定的偏移才认领执行。
+    // 偏移 = crc32(external_id) % (window_seconds + 1)，同一个任务每次的偏移都相同；不落库，不改 expect_time。
+    'stagger' => [
+        // 总开关。快扫入口是否注册由环境变量 TASK_SCHEDULER_STAGGER_ENABLED 决定，这里应引用同一个变量。
+        'enabled' => (bool) \Hyperf\Support\env('TASK_SCHEDULER_STAGGER_ENABLED', false),
+
+        // 快扫入口的基础 tick（秒），取值 1～60 且能整除 60。
+        // 入口按 TASK_SCHEDULER_STAGGER_TICK_SECONDS 注册，这里必须与之一致；不合法时整个错峰按关闭处理。
+        'tick_seconds' => (int) \Hyperf\Support\env('TASK_SCHEDULER_STAGGER_TICK_SECONDS', 5),
+
+        // 错峰规则，每个回调最多一条。未命中任何规则的任务保持原有分钟扫描，行为不变。
+        // 单条规则不合法时只丢弃这一条（相关任务按原时间执行），并记录一次警告。
+        'rules' => [
+            // [
+            //     // 回调方法，与创建任务时的 callback_method 一致；类名开头的 \ 和大小写不影响匹配。
+            //     'callback' => [App\Application\Demo\Service\DemoAppService::class, 'demoCallback'],
+            //     // 打散窗口（秒），0～600；0 表示不偏移。
+            //     'window_seconds' => 120,
+            //     // 快扫间隔（秒），必须是 tick_seconds 的整数倍，最大 60。
+            //     'scan_interval_seconds' => 5,
+            // ],
+        ],
+    ],
 ];

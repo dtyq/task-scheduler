@@ -309,12 +309,16 @@ class TaskSchedulerRepository extends AbstractRepository
      * 原扫描仍只处理Pending，以ID游标避免认领导致offset跳项。
      * @return TaskScheduler[]
      */
-    public function listForExecution(DateTime $cutoff, int $afterId, int $limit = 200): array
+    public function listForExecution(DateTime $cutoff, int $afterId, int $limit = 200, ?DateTime $notBefore = null): array
     {
-        $models = $this->createBuilder(TaskSchedulerModel::query())
+        $builder = $this->createBuilder(TaskSchedulerModel::query())
             ->where('status', TaskSchedulerStatus::Pending->value)
-            ->where('expect_time', '<=', $cutoff->format('Y-m-d H:i:s'))
-            ->where('id', '>', $afterId)->orderBy('id')->limit($limit)->get();
+            ->where('expect_time', '<=', $cutoff->format('Y-m-d H:i:s'));
+        // 错峰快扫只关心最近一段时间内到期的任务，下界让查询在 (status, expect_time) 索引上保持有界。
+        if ($notBefore !== null) {
+            $builder->where('expect_time', '>=', $notBefore->format('Y-m-d H:i:s'));
+        }
+        $models = $builder->where('id', '>', $afterId)->orderBy('id')->limit($limit)->get();
         $tasks = [];
         foreach ($models as $model) {
             $tasks[] = TaskSchedulerFactory::modelToEntity($model);
