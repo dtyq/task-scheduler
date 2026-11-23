@@ -18,12 +18,12 @@ use function Hyperf\Support\env;
 class ConfigProvider
 {
     /**
-     * 是否注册错峰快扫入口。加载 ConfigProvider 时运行时配置尚未就绪，只能读环境变量；
-     * 接入方的 task_scheduler.stagger.enabled 应引用同一个环境变量。
+     * 是否注册错峰快扫入口，默认开启，可通过环境变量显式关闭。
+     * 加载 ConfigProvider 时运行时配置尚未就绪；发布配置复用此方法，保持默认值和解析一致。
      */
     public static function staggerScanEnabled(): bool
     {
-        return filter_var(env('TASK_SCHEDULER_STAGGER_ENABLED', false), FILTER_VALIDATE_BOOLEAN);
+        return filter_var(env('TASK_SCHEDULER_STAGGER_ENABLED', true), FILTER_VALIDATE_BOOLEAN);
     }
 
     /**

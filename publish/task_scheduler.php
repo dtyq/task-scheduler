@@ -32,8 +32,8 @@ return [
     // 按回调方法错峰执行：命中规则的任务到 expect_time 后，再等一个稳定的偏移才认领执行。
     // 偏移 = crc32(external_id) % (window_seconds + 1)，同一个任务每次的偏移都相同；不落库，不改 expect_time。
     'stagger' => [
-        // 总开关。快扫入口是否注册由环境变量 TASK_SCHEDULER_STAGGER_ENABLED 决定，这里应引用同一个变量。
-        'enabled' => (bool) \Hyperf\Support\env('TASK_SCHEDULER_STAGGER_ENABLED', false),
+        // 总开关默认开启；与快扫入口复用同一判断，避免注册开关与运行配置默认值不一致。
+        'enabled' => \Dtyq\TaskScheduler\ConfigProvider::staggerScanEnabled(),
 
         // 快扫入口的基础 tick（秒），取值 1～60 且能整除 60。
         // 入口按 TASK_SCHEDULER_STAGGER_TICK_SECONDS 注册，这里必须与之一致；不合法时整个错峰按关闭处理。

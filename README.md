@@ -208,13 +208,13 @@ create index task_scheduler_log_task_id_index
 
 ### 按回调错峰执行
 
-同一时刻到期的大量任务会在同一分钟被一起认领，回调背后的资源（例如创建容器）会出现瞬时高峰。错峰规则让命中指定回调的任务在 `expect_time` 后再等待一个稳定偏移才认领，把高峰摊开。默认关闭、没有规则，未命中规则的任务行为不变。
+同一时刻到期的大量任务会在同一分钟被一起认领，回调背后的资源（例如创建容器）会出现瞬时高峰。错峰规则让命中指定回调的任务在 `expect_time` 后再等待一个稳定偏移才认领，把高峰摊开。快扫入口默认开启，默认没有规则；无有效规则时快扫直接返回，不查询任务数据库，未命中规则的任务行为不变。
 
 配置位于 `task_scheduler.stagger`（见 `publish/task_scheduler.php`）：
 
 ```php
 'stagger' => [
-    'enabled' => (bool) env('TASK_SCHEDULER_STAGGER_ENABLED', false),
+    'enabled' => \Dtyq\TaskScheduler\ConfigProvider::staggerScanEnabled(),
     'tick_seconds' => (int) env('TASK_SCHEDULER_STAGGER_TICK_SECONDS', 5),
     'rules' => [
         [
@@ -230,7 +230,7 @@ create index task_scheduler_log_task_id_index
 - 偏移：`crc32(external_id) % (window_seconds + 1)`。同一任务跨日、跨进程重启偏移不变；偏移不落库，`expect_time` 不变。修改窗口会改变待执行实例的偏移，不要在高峰中途调整。
 - 扫描：`TaskSchedulerStaggerExecuteCrontab` 按基础 tick 触发（`*/tick` 秒级规则），每条规则在 `tick 时刻 % scan_interval_seconds == 0` 时参与扫描，不记录进程内状态。快扫只读取 `expect_time` 在“最大窗口 + 120 秒”之内的 Pending 任务，回调在 PHP 中匹配；更早到期的任务由分钟入口处理。快扫不做 Running 维护。Hyperf crontab 每次触发都会新建执行器实例，两个入口各自使用本次触发的协程池。
 - 分钟入口：照常扫描，但跳过命中规则且未到有效时刻的任务；快扫入口缺失时它是兜底，最多多等约 60 秒，不会漏执行。拿到任务锁并重读后会再确认一次有效时刻。
-- 注册：加载 `ConfigProvider` 时运行时配置尚未就绪，快扫入口是否注册及其频率只读环境变量 `TASK_SCHEDULER_STAGGER_ENABLED`、`TASK_SCHEDULER_STAGGER_TICK_SECONDS`，`stagger.enabled` 与 `tick_seconds` 应引用同一组变量。两者不一致时不会漏执行；tick 不一致会记录警告。
+- 注册：快扫入口默认开启，设置 `TASK_SCHEDULER_STAGGER_ENABLED=false` 可关闭；发布配置复用 `ConfigProvider::staggerScanEnabled()` 保持默认值和解析一致。没有有效规则时仅有定时入口调用，不执行快扫数据库查询。加载 `ConfigProvider` 时运行时配置尚未就绪，快扫入口是否注册及其频率只读环境变量 `TASK_SCHEDULER_STAGGER_ENABLED`、`TASK_SCHEDULER_STAGGER_TICK_SECONDS`，`stagger.enabled` 与 `tick_seconds` 应引用同一组变量。两者不一致时不会漏执行；tick 不一致会记录警告。
 - 互斥：快扫入口与分钟入口名称不同，可以并行；同一任务由 Redis 锁与数据库条件认领保证只回调一次。快扫的单例锁过期时间为 30 秒，单次扫描超过一个 tick 时后续 tick 会被跳过。
 - 配置校验：tick 不合法时整体关闭；单条规则不合法或回调重复时只丢弃该条。问题汇总成一条警告，同一内容每个进程只记录一次（执行器每次触发都会重建，不按 tick 重复记录）。
 
