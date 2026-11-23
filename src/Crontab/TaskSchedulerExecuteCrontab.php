@@ -37,14 +37,16 @@ class TaskSchedulerExecuteCrontab
     private array $config;
 
     /**
+     * 本进程已记录过的错峰配置警告。Hyperf crontab 每次触发都会新建执行器实例，
+     * 警告按内容在进程内去重，避免每个 tick 重复记录。
+     * @var array<string, true>
+     */
+    private static array $reportedStaggerWarnings = [];
+
+    /**
      * 错峰规则集；为 null 时等同于未启用错峰。
      */
     private ?ExecutionStaggerRuleSet $staggerRules = null;
-
-    /**
-     * 快扫入口独立的协程池，避免分钟扫描积压时挤占快扫名额。
-     */
-    private ?Concurrent $staggerConcurrent = null;
 
     public function __construct(
         private readonly TaskSchedulerDomainService $scheduleTaskDomainService,
@@ -54,11 +56,9 @@ class TaskSchedulerExecuteCrontab
         $this->config = config('task_scheduler');
         $this->logger = $this->loggerFactory->get('task_scheduler');
         $limit = (int) ($this->config['concurrent_limit'] ?? 500);
+        // Hyperf crontab 每次触发都会新建执行器实例，分钟入口与快扫入口各自持有本次触发的协程池。
         $this->concurrent = new Concurrent(max($limit, 1));
         $this->staggerRules = $this->buildStaggerRules();
-        if ($this->staggerRules !== null) {
-            $this->staggerConcurrent = new Concurrent(max($limit, 1));
-        }
     }
 
     public function execute(): void
@@ -96,7 +96,7 @@ class TaskSchedulerExecuteCrontab
     public function executeStaggered(): void
     {
         $rules = $this->staggerRules;
-        if ($rules === null || ! $rules->isEnabled() || $this->staggerConcurrent === null) {
+        if ($rules === null || ! $rules->isEnabled()) {
             return;
         }
         $now = new DateTime();
@@ -125,7 +125,7 @@ class TaskSchedulerExecuteCrontab
                     ++$deferred;
                     continue;
                 }
-                $this->staggerConcurrent->create(function () use ($task): void {
+                $this->concurrent->create(function () use ($task): void {
                     $this->run($task);
                 });
             }
@@ -136,24 +136,37 @@ class TaskSchedulerExecuteCrontab
     }
 
     /**
-     * 构建错峰规则集，没有有效规则时返回 null；配置问题汇总记录一次，不按任务刷日志。
+     * 构建错峰规则集，没有有效规则时返回 null；配置问题每个进程只记录一次，不按任务或 tick 刷日志。
      */
     private function buildStaggerRules(): ?ExecutionStaggerRuleSet
     {
         $rules = ExecutionStaggerRuleSet::fromConfig((array) ($this->config['stagger'] ?? []));
         if ($rules->getProblems() !== []) {
-            $this->logger->warning('错峰配置存在问题，相关规则已忽略', ['problems' => $rules->getProblems()]);
+            $this->warnStaggerOnce('错峰配置存在问题，相关规则已忽略', ['problems' => $rules->getProblems()]);
         }
         if (! $rules->isEnabled()) {
             return null;
         }
         if ($rules->getTickSeconds() !== ConfigProvider::staggerTickSeconds()) {
-            $this->logger->warning('错峰 tick_seconds 与快扫入口注册频率不一致，跳拍按配置值计算', [
+            $this->warnStaggerOnce('错峰 tick_seconds 与快扫入口注册频率不一致，跳拍按配置值计算', [
                 'tick_seconds' => $rules->getTickSeconds(),
                 'registered_tick_seconds' => ConfigProvider::staggerTickSeconds(),
             ]);
         }
         return $rules;
+    }
+
+    /**
+     * 同一内容的错峰配置警告在本进程只记录一次；配置变化后内容不同，会重新记录。
+     */
+    private function warnStaggerOnce(string $message, array $context): void
+    {
+        $key = md5($message . json_encode($context));
+        if (isset(self::$reportedStaggerWarnings[$key])) {
+            return;
+        }
+        self::$reportedStaggerWarnings[$key] = true;
+        $this->logger->warning($message, $context);
     }
 
     /**

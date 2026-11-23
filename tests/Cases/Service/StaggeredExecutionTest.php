@@ -99,11 +99,9 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
                 default => [],
             };
         });
-        $stagger = $this->createMock(Concurrent::class);
-        $stagger->expects(self::exactly(2))->method('create');
-        $minute = $this->createMock(Concurrent::class);
-        $minute->expects(self::never())->method('create');
-        $worker = $this->worker($service, [], $minute, $this->rules(), $stagger);
+        $concurrent = $this->createMock(Concurrent::class);
+        $concurrent->expects(self::exactly(2))->method('create');
+        $worker = $this->worker($service, [], $concurrent, $this->rules());
         $worker->executeStaggered();
         self::assertSame([0, 11, 21], $seen);
     }
@@ -164,7 +162,7 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
     }
 
     /**
-     * 构建规则时配置问题只汇总记录一次；有效规则返回规则集，无有效规则时返回 null。
+     * 执行器每次触发都会重建，配置问题警告每个进程只记一次；有效规则返回规则集，无有效规则时返回 null。
      */
     public function testBuildStaggerRulesLogsProblemsOnce(): void
     {
@@ -176,7 +174,8 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
                 $this->records[] = [$level, (string) $message, $context];
             }
         };
-        $worker = $this->worker($this->createMock(TaskSchedulerDomainService::class), [
+        (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'reportedStaggerWarnings'))->setValue(null, []);
+        $config = [
             'stagger' => [
                 'enabled' => true,
                 'tick_seconds' => 5,
@@ -185,15 +184,21 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
                     ['callback' => self::OTHER_CALLBACK, 'window_seconds' => 999, 'scan_interval_seconds' => 5],
                 ],
             ],
-        ], $this->createMock(Concurrent::class), null);
-        (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'logger'))->setValue($worker, $logger);
-        $built = (new ReflectionMethod(TaskSchedulerExecuteCrontab::class, 'buildStaggerRules'))->invoke($worker);
+        ];
+        // Hyperf crontab 每次触发都会新建执行器，模拟三次触发。
+        $built = null;
+        for ($i = 0; $i < 3; ++$i) {
+            $worker = $this->worker($this->createMock(TaskSchedulerDomainService::class), $config, $this->createMock(Concurrent::class), null);
+            (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'logger'))->setValue($worker, $logger);
+            $built = (new ReflectionMethod(TaskSchedulerExecuteCrontab::class, 'buildStaggerRules'))->invoke($worker);
+        }
 
         $problems = array_values(array_filter($logger->records, static fn (array $record): bool => $record[1] === '错峰配置存在问题，相关规则已忽略'));
         self::assertCount(1, $problems);
         self::assertCount(1, $problems[0][2]['problems']);
         self::assertInstanceOf(ExecutionStaggerRuleSet::class, $built);
         self::assertTrue($built->isEnabled());
+        (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, 'reportedStaggerWarnings'))->setValue(null, []);
 
         $disabled = $this->worker($this->createMock(TaskSchedulerDomainService::class), ['stagger' => ['enabled' => false]], $this->createMock(Concurrent::class), null);
         self::assertNull((new ReflectionMethod(TaskSchedulerExecuteCrontab::class, 'buildStaggerRules'))->invoke($disabled));
@@ -234,7 +239,7 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
     /**
      * 绕过构造函数装配执行器，避免读取全局配置或创建真实协程池。
      */
-    private function worker(TaskSchedulerDomainService $service, array $config, Concurrent $concurrent, ?ExecutionStaggerRuleSet $rules, ?Concurrent $staggerConcurrent = null): TaskSchedulerExecuteCrontab
+    private function worker(TaskSchedulerDomainService $service, array $config, Concurrent $concurrent, ?ExecutionStaggerRuleSet $rules): TaskSchedulerExecuteCrontab
     {
         $worker = (new ReflectionClass(TaskSchedulerExecuteCrontab::class))->newInstanceWithoutConstructor();
         foreach ([
@@ -243,7 +248,6 @@ class StaggeredExecutionTest extends SchedulerServiceTestCase
             'logger' => new NullLogger(),
             'concurrent' => $concurrent,
             'staggerRules' => $rules,
-            'staggerConcurrent' => $rules === null ? null : ($staggerConcurrent ?? $this->createMock(Concurrent::class)),
         ] as $property => $value) {
             (new ReflectionProperty(TaskSchedulerExecuteCrontab::class, $property))->setValue($worker, $value);
         }
